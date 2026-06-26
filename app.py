@@ -27,6 +27,7 @@ If you want only top 5 products per collection in the PDF:
 from __future__ import annotations
 
 import argparse
+import mimetypes
 import os
 import re
 import unicodedata
@@ -45,6 +46,7 @@ from reportlab.lib.units import inch
 from reportlab.platypus import (
     BaseDocTemplate,
     Frame,
+    Image as RLImage,
     PageBreak,
     PageTemplate,
     Paragraph,
@@ -100,6 +102,18 @@ REQUIRED_COLUMNS = [
     "Variant Inventory Qty",
     "Variant Price",
 ]
+
+# Logo file settings.
+# Put your logo in the same folder as app.py. Best name: logo.png
+# This code also supports logo.jpg, logo.jpeg, logo.webp and common folders like static/assets/images.
+LOGO_FILE_NAME = "logo.png"
+LOGO_CANDIDATE_NAMES = [
+    "logo.png", "Logo.png", "LOGO.png", "logo.PNG",
+    "logo.jpg", "Logo.jpg", "LOGO.jpg", "logo.JPG",
+    "logo.jpeg", "Logo.jpeg", "LOGO.jpeg", "logo.JPEG",
+    "logo.webp", "Logo.webp", "LOGO.webp", "logo.WEBP",
+]
+LOGO_SEARCH_SUBFOLDERS = ["", "static", "assets", "images"]
 
 
 # =========================
@@ -201,6 +215,87 @@ def normalise_bool(value: str) -> str:
 
 def safe_filename_stem(path: str) -> str:
     return Path(path).stem.replace(" ", "_").replace("(", "").replace(")", "")
+
+
+def app_base_dir() -> Path:
+    """Return the folder where this app.py file lives."""
+    return Path(__file__).resolve().parent
+
+
+def find_logo_file() -> Optional[Path]:
+    """Find the logo safely on Windows and Linux.
+
+    Windows is usually forgiving about filename case, but Amazon Linux is not.
+    This function checks the app folder, current working folder, and common
+    static folders. It supports png/jpg/jpeg/webp so the app still works if
+    the logo file is not exactly named logo.png.
+    """
+    env_logo = os.getenv("BOOSTEREX_LOGO_FILE", "").strip()
+    base_dirs = [app_base_dir(), Path.cwd()]
+    candidates: List[Path] = []
+
+    if env_logo:
+        candidates.append(Path(env_logo).expanduser())
+
+    for base in base_dirs:
+        for subfolder in LOGO_SEARCH_SUBFOLDERS:
+            folder = base / subfolder if subfolder else base
+            for name in LOGO_CANDIDATE_NAMES:
+                candidates.append(folder / name)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            continue
+        key = str(resolved).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if resolved.is_file():
+            return resolved
+
+    # Last fallback: scan the folders case-insensitively for any file whose stem is "logo".
+    scanned_dirs: set[Path] = set()
+    allowed_exts = {".png", ".jpg", ".jpeg", ".webp"}
+    for base in base_dirs:
+        for subfolder in LOGO_SEARCH_SUBFOLDERS:
+            folder = base / subfolder if subfolder else base
+            try:
+                folder = folder.resolve()
+            except Exception:
+                continue
+            if folder in scanned_dirs or not folder.is_dir():
+                continue
+            scanned_dirs.add(folder)
+            try:
+                for item in folder.iterdir():
+                    if item.is_file() and item.stem.lower() == "logo" and item.suffix.lower() in allowed_exts:
+                        return item
+            except Exception:
+                continue
+
+    return None
+
+
+def logo_media_type(path: Path) -> str:
+    """Return the correct media type for the logo response."""
+    guessed, _ = mimetypes.guess_type(str(path))
+    return guessed or "application/octet-stream"
+
+def build_logo_flowable(max_width: float = 1.10 * inch, max_height: float = 0.70 * inch) -> Optional[RLImage]:
+    """Create a ReportLab image flowable for the PDF logo, if logo exists."""
+    logo_path = find_logo_file()
+    if not logo_path:
+        return None
+
+    try:
+        logo = RLImage(str(logo_path), width=max_width, height=max_height, kind="proportional")
+        logo.hAlign = "LEFT"
+        return logo
+    except Exception:
+        return None
 
 
 @dataclass
@@ -694,6 +789,11 @@ def make_pdf(
     story = []
 
     # Page 1: summary
+    logo = build_logo_flowable()
+    if logo is not None:
+        story.append(logo)
+        story.append(Spacer(1, 8))
+
     story.append(p("INVENTORY REPORT", styles["ReportTitle"]))
     story.append(p(REPORT_SUBTITLE, styles["Subtitle"]))
     story.append(build_pill_row(styles))
@@ -826,6 +926,46 @@ MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 app = FastAPI(title=APP_TITLE)
 
 
+@app.get("/logo.png")
+async def serve_logo_png():
+    """Backward-compatible logo URL."""
+    return await serve_logo_asset()
+
+
+@app.get("/assets/logo")
+async def serve_logo_asset():
+    """Serve the app logo from the app folder/static/assets/images.
+
+    Use this URL in the browser: /assets/logo
+    If it returns 404, the server cannot see your logo file.
+    """
+    logo_path = find_logo_file()
+    if not logo_path:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Logo file not found. Put logo.png in the same folder as app.py, "
+                "or put logo.png/logo.jpg inside static, assets, or images folder."
+            ),
+        )
+    return FileResponse(str(logo_path), media_type=logo_media_type(logo_path))
+
+
+@app.get("/debug/logo")
+async def debug_logo():
+    """Quick check for EC2/Linux: open /debug/logo to see what path the app finds."""
+    logo_path = find_logo_file()
+    return JSONResponse(
+        {
+            "found": bool(logo_path),
+            "path": str(logo_path) if logo_path else None,
+            "app_folder": str(app_base_dir()),
+            "current_working_folder": str(Path.cwd()),
+            "accepted_names": LOGO_CANDIDATE_NAMES,
+            "accepted_folders": ["same folder as app.py", "static", "assets", "images"],
+        }
+    )
+
 INDEX_HTML = """
 <!doctype html>
 <html lang="en">
@@ -906,11 +1046,24 @@ INDEX_HTML = """
       justify-content: center;
       width: 56px;
       height: 56px;
+      min-width: 56px;
       border-radius: 18px;
       background: var(--accent);
       color: white;
+      font-size: 22px;
       font-weight: 900;
+      line-height: 1;
       letter-spacing: 0.08em;
+      overflow: hidden;
+    }
+
+    .logo img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+      background: white;
+      padding: 5px;
     }
 
     .tag {
@@ -1196,7 +1349,7 @@ INDEX_HTML = """
       <div class="panel intro">
         <div>
           <div class="brand-row">
-            <div class="logo">B</div>
+            <div class="logo"><img src="/assets/logo?v=3" alt="BOOSTEREX logo" onerror="this.parentElement.innerHTML='B';"></div>
             <div class="tag">CSV verified PDF report</div>
           </div>
           <h1>BOOSTEREX inventory report generator.</h1>
@@ -1561,7 +1714,14 @@ async def download_report(file_name: str):
 if __name__ == "__main__":
     ensure_web_dirs()
     print("\nBOOSTEREX Inventory Report Generator")
+    logo_path = find_logo_file()
     print("Open this local link in your browser:")
-    print("http://127.0.0.1:8000\n")
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    print("http://127.0.0.1:8000")
+    print("Logo found:", str(logo_path) if logo_path else "NO - put logo.png beside app.py")
+    print("Logo debug:", "http://127.0.0.1:8000/debug/logo")
+    print("On Amazon Linux/EC2, run with host 0.0.0.0 and open your public IP/security-group port.\n")
+
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(app, host=host, port=port)
 
