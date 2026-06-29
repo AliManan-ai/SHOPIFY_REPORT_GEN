@@ -93,6 +93,33 @@ COLLECTION_TAGS: List[Tuple[str, str]] = [
     ("Zarah", "zarah"),
 ]
 
+AFROZEH_COLLECTION_TAGS: List[Tuple[str, List[str]]] = [
+    ("Basic Pret '26", ["Basic Pret '26"]),
+    ("A Lawn", ["A Lawn", "a lawn"]),
+    ("The Haze '2026", ["The Haze '2026"]),
+    ("Florette'26", ["Florette'26"]),
+    ("The Brides Edit'26", ["The Brides Edit'26"]),
+    ("The Brides Edit '24", ["The Brides Edit '24"]),
+    ("Summer Together'26", ["Summer Together'26"]),
+    ("Divani Silk Edit", ["Divani Silk Edit"]),
+    ("Hayat '24", ["Hayat '24"]),
+    ("The Brides Edit '23", ["The Brides Edit '23"]),
+    ("Sheer Khurma", ["Sheer Khurma"]),
+    ("Muted Muse '26", ["Muted Muse '26"]),
+    ("Cords Pret 2026", ["Cords Pret 2026"]),
+    ("Day Break'26", ["Day Break'26"]),
+    ("Slate", ["Slate"]),
+    ("Hayat'25", ["Hayat'25"]),
+    ("La Fuchsia '25", ["La Fuchsia 25", "La Fuchsia '25"]),
+    ("Mulaqaat'26", ["Mulaqaat'26"]),
+    ("Sunspell '2026", ["SUNSPELL '2026", "Sunspell '2026"]),
+    ("Afrozeh Collection", ["Afrozeh Collection"]),
+    ("Elara Luxury Pret", ["ELARA LUXURY PRET", "Elara Luxury Pret"]),
+    ("New In", ["New In"]),
+    ("La Fuchsia Festive Unstitched", ["La Fuchsia Festive Unstitched"]),
+    ("Damask'25", ["DAMASK'25", "Damask'25"]),
+]
+
 REQUIRED_COLUMNS = [
     "Handle",
     "Title",
@@ -101,6 +128,12 @@ REQUIRED_COLUMNS = [
     "Status",
     "Variant Inventory Qty",
     "Variant Price",
+]
+
+TYPE_COLUMN_CANDIDATES = [
+    "Type",
+    "Product Type",
+    "Product type",
 ]
 
 # Logo file settings.
@@ -162,6 +195,16 @@ def first_non_empty(series: pd.Series) -> str:
     return ""
 
 
+def first_existing_non_empty(group: pd.DataFrame, columns: Iterable[str], fallback: str = "") -> str:
+    """Return first non-empty value from the first available column in a group."""
+    for col in columns:
+        if col in group.columns:
+            value = first_non_empty(group[col])
+            if value:
+                return value
+    return fallback
+
+
 def split_tags(tags: str) -> set:
     """Split Shopify comma-separated Tags into exact lowercase tags."""
     if not tags:
@@ -169,13 +212,28 @@ def split_tags(tags: str) -> set:
     return {clean_text(t).lower() for t in str(tags).split(",") if clean_text(t)}
 
 
+def has_exact_tag(tag_set: set, aliases: Iterable[str]) -> bool:
+    return any(clean_text(alias).lower() in tag_set for alias in aliases)
+
+
 def detect_collection(tags: str) -> str:
     """Detect collection from exact tag match."""
     tag_set = split_tags(tags)
+
+    for collection_name, aliases in AFROZEH_COLLECTION_TAGS:
+        if has_exact_tag(tag_set, aliases):
+            return collection_name
+
     for collection_name, tag in COLLECTION_TAGS:
         if tag.lower() in tag_set:
             return collection_name
-    return "Other"
+    return "Other / Unmapped"
+
+
+def detect_product_type(group: pd.DataFrame) -> str:
+    """Detect Shopify product type without using long taxonomy categories."""
+    product_type = first_existing_non_empty(group, TYPE_COLUMN_CANDIDATES, fallback="No Type")
+    return product_type if product_type else "No Type"
 
 
 def format_int(value) -> str:
@@ -201,6 +259,44 @@ def format_money(value, compact: bool = True) -> str:
         if amount_abs >= 100_000:  # 1 lakh
             return f"{sign}Rs {amount_abs / 100_000:.1f}L"
     return f"{sign}Rs {int(round(amount_abs)):,}"
+
+
+def format_money_millions(value) -> str:
+    """Format money like the reference PDF: Rs. 168.33M or Rs. 780."""
+    try:
+        amount = float(value)
+    except Exception:
+        amount = 0.0
+
+    sign = "-" if amount < 0 else ""
+    amount_abs = abs(amount)
+    if amount_abs >= 1_000_000:
+        return f"{sign}Rs. {amount_abs / 1_000_000:.2f}M"
+    return f"{sign}Rs. {int(round(amount_abs)):,}"
+
+
+def format_money_metric(value) -> str:
+    """Short money format for narrow metric cards."""
+    try:
+        amount = float(value)
+    except Exception:
+        amount = 0.0
+    sign = "-" if amount < 0 else ""
+    amount_abs = abs(amount)
+    if amount_abs >= 1_000_000:
+        return f"{sign}Rs.{amount_abs / 1_000_000:.0f}M"
+    return format_money_millions(value).replace("Rs. ", "Rs.")
+
+
+def format_money_crore(value) -> str:
+    """Format money in crore for the overall summary."""
+    try:
+        amount = float(value)
+    except Exception:
+        amount = 0.0
+
+    sign = "-" if amount < 0 else ""
+    return f"{sign}Rs. {abs(amount) / 10_000_000:.2f} crore"
 
 
 def format_price_range(min_price: float, max_price: float) -> str:
@@ -303,6 +399,7 @@ class ReportData:
     products_all: pd.DataFrame
     active_published: pd.DataFrame
     stocked_products: pd.DataFrame
+    type_overview: pd.DataFrame
     collection_overview: pd.DataFrame
     metrics: Dict[str, float]
     audit: Dict[str, float]
@@ -333,6 +430,34 @@ def load_and_prepare(csv_path: str) -> pd.DataFrame:
     return df
 
 
+def build_inventory_overview(products: pd.DataFrame, group_col: str, empty_label: str) -> pd.DataFrame:
+    """Build an Afrozeh-style inventory summary by type or collection."""
+    rows = []
+    if products.empty or group_col not in products.columns:
+        return pd.DataFrame(
+            columns=[group_col, "Products", "With_Stock", "Available_Units", "Current_Value"]
+        )
+
+    for name, group in products.groupby(group_col, sort=False, dropna=False):
+        label = clean_text(name) or empty_label
+        stocked = group[group["Units"] > 0]
+        rows.append(
+            {
+                group_col: label,
+                "Products": int(group["Handle"].nunique()),
+                "With_Stock": int(stocked["Handle"].nunique()),
+                "Available_Units": float(stocked["Units"].sum()),
+                "Current_Value": float(stocked["Exact Retail Value"].sum()),
+            }
+        )
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values(["Current_Value", "Products"], ascending=[False, False])
+        .reset_index(drop=True)
+    )
+
+
 def build_report_data(csv_path: str) -> ReportData:
     df = load_and_prepare(csv_path)
 
@@ -359,6 +484,7 @@ def build_report_data(csv_path: str) -> ReportData:
                 "Handle": clean_text(handle),
                 "Title": title,
                 "Tags": tags,
+                "Type": detect_product_type(group),
                 "Collection": detect_collection(tags),
                 "Status": status,
                 "Published": published,
@@ -385,17 +511,8 @@ def build_report_data(csv_path: str) -> ReportData:
 
     stocked = active_published[active_published["Units"] > 0].copy()
 
-    collection_overview = (
-        stocked.groupby("Collection", as_index=False)
-        .agg(
-            Products=("Handle", "nunique"),
-            Available_Units=("Units", "sum"),
-            Exact_Retail_Value=("Exact Retail Value", "sum"),
-            Simple_Retail_Value=("Simple Retail Value", "sum"),
-        )
-        .sort_values("Exact_Retail_Value", ascending=False)
-        .reset_index(drop=True)
-    )
+    type_overview = build_inventory_overview(active_published, "Type", "No Type")
+    collection_overview = build_inventory_overview(active_published, "Collection", "Other")
 
     metrics = {
         "Active + Published": int(active_published["Handle"].nunique()),
@@ -421,6 +538,7 @@ def build_report_data(csv_path: str) -> ReportData:
         products_all=products,
         active_published=active_published,
         stocked_products=stocked,
+        type_overview=type_overview,
         collection_overview=collection_overview,
         metrics=metrics,
         audit=audit,
@@ -574,7 +692,7 @@ def build_metric_cards(report: ReportData, styles) -> Table:
         ("Products with stock", format_int(metrics["Products with stock"]), "Positive inventory"),
         ("Out of stock", format_int(metrics["Out of stock"]), "Zero or negative total"),
         ("Available units", format_int(metrics["Available units"]), "All variants combined"),
-        ("Inventory value", format_money(metrics["Inventory value"]), "Variant-level retail"),
+        ("Inventory value", format_money_metric(metrics["Inventory value"]), "Variant-level retail"),
     ]
 
     row = []
@@ -673,29 +791,79 @@ def build_rules_table(styles) -> Table:
     return tbl
 
 
-def build_collection_table(report: ReportData, styles) -> Table:
-    rows = [["Collection", "Products", "Available Units", "Exact Retail Value", "Simple Value"]]
-    for _, row in report.collection_overview.iterrows():
+def build_overall_summary_table(report: ReportData, styles) -> Table:
+    metrics = report.metrics
+    rows = [
+        ["Metric", "Value"],
+        ["Active + Published Products", format_int(metrics["Active + Published"])],
+        ["Products With Stock", format_int(metrics["Products with stock"])],
+        ["Out of Stock Products", format_int(metrics["Out of stock"])],
+        ["Available Units", f"{format_int(metrics['Available units'])} pcs"],
+        ["Current Inventory Value", format_money_millions(metrics["Inventory value"])],
+        ["Current Value in Crore", format_money_crore(metrics["Inventory value"])],
+    ]
+    tbl = Table(rows, colWidths=[3.6 * inch, 2.4 * inch])
+    style = table_style()
+    style = add_number_alignment(style, [1])
+    tbl.setStyle(style)
+    return tbl
+
+
+def build_type_table(report: ReportData, styles) -> Table:
+    rows = [["Type", "Products", "With Stock", "Available Units", "Current Value"]]
+    for _, row in report.type_overview.iterrows():
         rows.append(
             [
-                row["Collection"],
+                p(row["Type"], styles["Tiny"]),
                 format_int(row["Products"]),
+                format_int(row["With_Stock"]),
                 format_int(row["Available_Units"]),
-                format_money(row["Exact_Retail_Value"]),
-                format_money(row["Simple_Retail_Value"]),
+                format_money_millions(row["Current_Value"]),
             ]
         )
     rows.append(
         [
-            "Total",
+            p("Total", styles["TinyBold"]),
+            format_int(report.metrics["Active + Published"]),
             format_int(report.metrics["Products with stock"]),
             format_int(report.metrics["Available units"]),
-            format_money(report.metrics["Inventory value"]),
-            format_money(report.metrics["Simple inventory value"]),
+            format_money_millions(report.metrics["Inventory value"]),
         ]
     )
 
-    tbl = Table(rows, colWidths=[1.7 * inch, 1.0 * inch, 1.35 * inch, 1.45 * inch, 1.25 * inch], repeatRows=1)
+    tbl = Table(rows, colWidths=[2.75 * inch, 0.8 * inch, 0.9 * inch, 1.25 * inch, 1.35 * inch], repeatRows=1)
+    style = table_style()
+    style = add_number_alignment(style, [1, 2, 3, 4])
+    last_row = len(rows) - 1
+    style.add("FONTNAME", (0, last_row), (-1, last_row), "Helvetica-Bold")
+    style.add("BACKGROUND", (0, last_row), (-1, last_row), colors.HexColor("#EAF7EE"))
+    tbl.setStyle(style)
+    return tbl
+
+
+def build_collection_table(report: ReportData, styles) -> Table:
+    rows = [["Collection", "Products", "With Stock", "Available Units", "Current Value"]]
+    for _, row in report.collection_overview.iterrows():
+        rows.append(
+            [
+                p(row["Collection"], styles["Tiny"]),
+                format_int(row["Products"]),
+                format_int(row["With_Stock"]),
+                format_int(row["Available_Units"]),
+                format_money_millions(row["Current_Value"]),
+            ]
+        )
+    rows.append(
+        [
+            p("Total", styles["TinyBold"]),
+            format_int(report.metrics["Active + Published"]),
+            format_int(report.metrics["Products with stock"]),
+            format_int(report.metrics["Available units"]),
+            format_money_millions(report.metrics["Inventory value"]),
+        ]
+    )
+
+    tbl = Table(rows, colWidths=[2.75 * inch, 0.8 * inch, 0.9 * inch, 1.25 * inch, 1.35 * inch], repeatRows=1)
     style = table_style()
     style = add_number_alignment(style, [1, 2, 3, 4])
     last_row = len(rows) - 1
@@ -807,11 +975,15 @@ def make_pdf(
         story.append(comparison)
 
     story.append(Spacer(1, 8))
-    story.append(p("Calculation Rules", styles["SectionTitle"]))
-    story.append(build_rules_table(styles))
+    story.append(p("Overall Summary", styles["SectionTitle"]))
+    story.append(build_overall_summary_table(report, styles))
 
     story.append(Spacer(1, 8))
-    story.append(p("Collection-wise Overview", styles["SectionTitle"]))
+    story.append(p("Type-wise Inventory", styles["SectionTitle"]))
+    story.append(build_type_table(report, styles))
+
+    story.append(PageBreak())
+    story.append(p("Collection-wise Inventory", styles["SectionTitle"]))
     story.append(build_collection_table(report, styles))
 
     story.append(PageBreak())
@@ -831,7 +1003,9 @@ def make_pdf(
     )
     story.append(Spacer(1, 8))
 
-    collection_order = report.collection_overview["Collection"].tolist()
+    collection_order = report.collection_overview[
+        report.collection_overview["With_Stock"] > 0
+    ]["Collection"].tolist()
     for idx, collection in enumerate(collection_order):
         products = report.stocked_products[report.stocked_products["Collection"] == collection].copy()
         products = products.sort_values("Exact Retail Value", ascending=False)
@@ -840,9 +1014,9 @@ def make_pdf(
 
         coll_row = report.collection_overview[report.collection_overview["Collection"] == collection].iloc[0]
         heading_text = (
-            f"{collection} - {format_money(coll_row['Exact_Retail_Value'])} - "
+            f"{collection} - {format_money(coll_row['Current_Value'])} - "
             f"{format_int(coll_row['Available_Units'])} units - "
-            f"{format_int(coll_row['Products'])} products"
+            f"{format_int(coll_row['With_Stock'])} stocked products"
         )
         story.append(p(heading_text, styles["SectionTitle"]))
         story.append(build_products_table(products, styles))
@@ -1724,4 +1898,3 @@ if __name__ == "__main__":
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host=host, port=port)
-
