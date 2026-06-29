@@ -34,7 +34,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional
 
 import pandas as pd
 
@@ -71,55 +71,6 @@ DEFAULT_PRODUCTS_PER_COLLECTION = None
 # If you do not want comparison, set PREVIOUS_REPORT_METRICS = None
 PREVIOUS_REPORT_METRICS = None
 
-# Exact collection tag matching. Order matters: mini26 must be checked before mini.
-COLLECTION_TAGS: List[Tuple[str, str]] = [
-    ("Mini26", "mini26"),
-    ("Noirae26", "noirae26"),
-    ("MiniV2", "miniv2"),
-    ("NoiraeV2", "noiraev2"),
-    ("Mini", "mini"),
-    ("Barfi", "barfi"),
-    ("Premiere", "premiere"),
-    ("Noirae", "noirae"),
-    ("Muse", "muse"),
-    ("Khushiyan", "khushiyan"),
-    ("Pret26", "pret26"),
-    ("Pret", "pret"),
-    ("Sorelle2", "sorelle2"),
-    ("Solace", "solace"),
-    ("Lemonade", "lemonade"),
-    ("Capsule", "capsule"),
-    ("Grown2", "grown2"),
-    ("Zarah", "zarah"),
-]
-
-AFROZEH_COLLECTION_TAGS: List[Tuple[str, List[str]]] = [
-    ("Basic Pret '26", ["Basic Pret '26"]),
-    ("A Lawn", ["A Lawn", "a lawn"]),
-    ("The Haze '2026", ["The Haze '2026"]),
-    ("Florette'26", ["Florette'26"]),
-    ("The Brides Edit'26", ["The Brides Edit'26"]),
-    ("The Brides Edit '24", ["The Brides Edit '24"]),
-    ("Summer Together'26", ["Summer Together'26"]),
-    ("Divani Silk Edit", ["Divani Silk Edit"]),
-    ("Hayat '24", ["Hayat '24"]),
-    ("The Brides Edit '23", ["The Brides Edit '23"]),
-    ("Sheer Khurma", ["Sheer Khurma"]),
-    ("Muted Muse '26", ["Muted Muse '26"]),
-    ("Cords Pret 2026", ["Cords Pret 2026"]),
-    ("Day Break'26", ["Day Break'26"]),
-    ("Slate", ["Slate"]),
-    ("Hayat'25", ["Hayat'25"]),
-    ("La Fuchsia '25", ["La Fuchsia 25", "La Fuchsia '25"]),
-    ("Mulaqaat'26", ["Mulaqaat'26"]),
-    ("Sunspell '2026", ["SUNSPELL '2026", "Sunspell '2026"]),
-    ("Afrozeh Collection", ["Afrozeh Collection"]),
-    ("Elara Luxury Pret", ["ELARA LUXURY PRET", "Elara Luxury Pret"]),
-    ("New In", ["New In"]),
-    ("La Fuchsia Festive Unstitched", ["La Fuchsia Festive Unstitched"]),
-    ("Damask'25", ["DAMASK'25", "Damask'25"]),
-]
-
 REQUIRED_COLUMNS = [
     "Handle",
     "Title",
@@ -135,6 +86,112 @@ TYPE_COLUMN_CANDIDATES = [
     "Product Type",
     "Product type",
 ]
+
+COLLECTION_COLUMN_CANDIDATES = [
+    "Collection",
+    "Collections",
+    "Collection Name",
+    "Collection Names",
+    "Custom Collection",
+    "Custom Collections",
+    "Smart Collection",
+    "Smart Collections",
+    "Manual Collection",
+    "Manual Collections",
+    "Product Collection",
+    "Product Collections",
+    "Shopify Collection",
+    "Shopify Collections",
+]
+
+SIZE_TAGS = {
+    "xxs", "xs", "s", "m", "l", "xl", "xxl", "xxxl", "2xl", "3xl", "4xl", "5xl",
+    "small", "medium", "large", "extra small", "extra large",
+}
+
+NON_COLLECTION_TAGS = {
+    "new", "newin", "new in", "new arrival", "new arrivals",
+    "restock", "restocked", "new restocked",
+    "sale", "discount", "discount sale", "special offer",
+    "stitched", "unstitched", "stitch", "unstitch",
+    "women", "woman", "men", "man", "girls", "boys", "kids", "ladies",
+    "womenswear", "menswear",
+    "cotton", "karandi", "lawn", "silk", "chiffon", "organza", "doria", "net",
+    "summer", "summers", "winter", "winters",
+    "no sync", "hidden", "nada-hidden", "hide", "ppd-elgbl", "ppd-ex",
+    "pk active products", "active products",
+}
+
+NON_COLLECTION_PATTERNS = [
+    r"_",
+    r"\bymq\b",
+    r"size\s*chart",
+    r"sizechart",
+    r"\bfabric\b",
+    r"cod",
+    r"\bcustom\b",
+    r"\bflow\b",
+    r"\bcart\b",
+    r"\bdelivery\b",
+    r"\boption\b",
+    r"\bnote\b",
+    r"\bgrade\b",
+    r"\beligible\b",
+    r"\bhidden\b",
+    r"\bhide\b",
+    r"\bsync\b",
+    r"\bactive\s+products\b",
+    r"\bdiscount\b",
+    r"\bsale\s*\d*",
+    r"\brestock",
+    r"\bflat\s*\d+",
+    r"\bnew\s*in\s*\d+",
+    r"\bnew\s*arrivals?\s*\d*",
+    r"\bnewarrivals?\s*\d*",
+    r"\brev[-\s]?\d+%?",
+    r"%",
+    r"\b\d+%\s*off\b",
+    r"\boff\b",
+    r"\btoday\b",
+    r"\bshirt\b",
+    r"\btrouser",
+    r"\bpeshwas\b",
+    r"\blehnga\b",
+    r"\blehenga\b",
+    r"\blehngas\b",
+    r"\bcholi\b",
+    r"\bmaxi\b",
+    r"\bsharara\b",
+    r"\bpeplum\b",
+    r"\bwedding\s+formal",
+    r"\bwedding\s+formals",
+    r"\bformals\b",
+    r"\|",
+    r"\bproducts?\s+from\s+sheet\b",
+    r"\bcollection\s+products\b",
+    r"\blow\s+selling\b",
+    r"\bhigh\s+inventory\b",
+    r"\bdupatta\b",
+    r"\bshawl\s+only\b",
+    r"\b\d+\s*-\s*\d+\s*(pkr|rs)?\b",
+    r"\b(pkr|rs)\b",
+    r"^\d+\s*(pkr|rs)$",
+    r"^\d{1,2}[-\s_/]?(jan|feb|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|nov|dec|december)",
+    r"^\d{1,2}[-\s_/]?[a-z]+[-\s_/]?\d{2,4}",
+    r"^\d{1,2}(st|nd|rd|th)?\s+[a-z]+\s+\d{2,4}",
+    r"^\d{1,2}[a-z]{3}\d{2,4}$",
+    r"^[a-z]{2,}[-\s_/]?(jan|feb|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|nov|dec|december)[-\s_/]?\d{2,4}$",
+    r"^[a-z]{1,4}\s+\d{2,4}$",
+    r"^[a-z]{1,4}[-_/][a-z]{1,4}$",
+]
+
+COLLECTION_KEYWORDS = {
+    "collection", "pret", "lawn", "formal", "formals", "wear", "summer", "winter",
+    "eid", "edit", "prints", "printed", "exclusive", "signature", "luxury", "daily",
+    "casual", "fancy", "festive", "bridal", "chiffon", "organza", "silk", "doria",
+}
+
+MIN_COLLECTION_TAG_SCORE = 25
 
 # Logo file settings.
 # Put your logo in the same folder as app.py. Best name: logo.png
@@ -205,29 +262,133 @@ def first_existing_non_empty(group: pd.DataFrame, columns: Iterable[str], fallba
     return fallback
 
 
-def split_tags(tags: str) -> set:
-    """Split Shopify comma-separated Tags into exact lowercase tags."""
-    if not tags:
-        return set()
-    return {clean_text(t).lower() for t in str(tags).split(",") if clean_text(t)}
+def detect_collection_from_columns(group: pd.DataFrame) -> str:
+    """Read collection from CSV columns when the export includes them."""
+    return first_existing_non_empty(group, COLLECTION_COLUMN_CANDIDATES, fallback="")
 
 
-def has_exact_tag(tag_set: set, aliases: Iterable[str]) -> bool:
-    return any(clean_text(alias).lower() in tag_set for alias in aliases)
+def normalise_match_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", clean_text(value).lower())
 
 
-def detect_collection(tags: str) -> str:
-    """Detect collection from exact tag match."""
-    tag_set = split_tags(tags)
+def looks_like_product_code(tag: str, handle: str, title: str) -> bool:
+    tag_clean = clean_text(tag)
+    tag_key = normalise_match_text(tag_clean)
+    handle_key = normalise_match_text(handle)
+    title_key = normalise_match_text(title)
 
-    for collection_name, aliases in AFROZEH_COLLECTION_TAGS:
-        if has_exact_tag(tag_set, aliases):
-            return collection_name
+    if tag_key and tag_key in {handle_key, title_key}:
+        return True
+    if handle_key and tag_key.startswith(handle_key):
+        return True
+    if re.fullmatch(r"[A-Z]{1,6}[-_/]?\d+[A-Z0-9-_/]*", tag_clean):
+        return True
+    if re.fullmatch(r"[A-Z]{2,}[-_/][A-Z0-9-_/]+", tag_clean):
+        return True
+    return False
 
-    for collection_name, tag in COLLECTION_TAGS:
-        if tag.lower() in tag_set:
-            return collection_name
-    return "Other / Unmapped"
+
+def is_collection_tag_candidate(tag: str, handle: str, title: str, disallowed_exact_tags: set[str]) -> bool:
+    tag_clean = clean_text(tag)
+    if not tag_clean:
+        return False
+
+    lower = tag_clean.lower().strip("_- ")
+    if lower in disallowed_exact_tags:
+        return False
+    if lower in SIZE_TAGS or lower in NON_COLLECTION_TAGS:
+        return False
+    if looks_like_product_code(tag_clean, handle, title):
+        return False
+    if re.fullmatch(r"[A-Z]{1,3}", tag_clean):
+        return False
+    if len(tag_clean) <= 1:
+        return False
+    if tag_clean.isdigit():
+        return False
+    if re.fullmatch(r"[_\W\d]+", tag_clean):
+        return False
+
+    for pattern in NON_COLLECTION_PATTERNS:
+        if re.search(pattern, lower, flags=re.IGNORECASE):
+            return False
+    return True
+
+
+def score_collection_tag(tag: str, tag_counts: Dict[str, int]) -> float:
+    tag_clean = clean_text(tag)
+    lower = tag_clean.lower()
+    words = re.findall(r"[a-z0-9]+", lower)
+    count = tag_counts.get(lower, 1)
+
+    score = 0.0
+    score += min(count, 80) * 0.8
+    if len(words) >= 2:
+        score += 35
+    if len(words) >= 3:
+        score += 10
+    if any(word in COLLECTION_KEYWORDS for word in words):
+        score += 45
+    if any(keyword in lower for keyword in ["pret", "lawn", "formal", "wear", "edit"]):
+        score += 20
+    if re.search(r"[a-z]+v\d+$", lower):
+        score += 45
+    elif re.search(r"[a-z]{4,}\d{2,4}$", lower):
+        score += 40
+    if len(words) == 1 and count >= 8 and tag_clean[:1].isupper() and not tag_clean.isupper():
+        score += 25
+    if tag_clean.isupper() and len(words) <= 2:
+        score -= 10
+    if count <= 1:
+        score -= 20
+    return score
+
+
+def pretty_tag_score(tag: str) -> int:
+    tag_clean = clean_text(tag)
+    if not tag_clean:
+        return 0
+    if tag_clean.isupper():
+        return 1
+    if tag_clean.islower():
+        return 2
+    if re.search(r"[A-Z]", tag_clean):
+        return 4
+    return 3
+
+
+def build_canonical_tag_display(tag_display_counts: Dict[str, Dict[str, int]]) -> Dict[str, str]:
+    canonical = {}
+    for key, display_counts in tag_display_counts.items():
+        selected = max(
+            display_counts,
+            key=lambda tag: (pretty_tag_score(tag), display_counts[tag], len(tag)),
+        )
+        if selected.isupper() and len(selected) > 3:
+            selected = selected.title()
+        canonical[key] = selected
+    return canonical
+
+
+def infer_collection_from_tags(
+    tags: str,
+    handle: str,
+    title: str,
+    tag_counts: Dict[str, int],
+    tag_display: Dict[str, str],
+    disallowed_exact_tags: set[str],
+) -> str:
+    """Pick one best collection-like tag for products without a collection column."""
+    candidates = [
+        tag for tag in product_tags_for_overview(tags)
+        if is_collection_tag_candidate(tag, handle, title, disallowed_exact_tags)
+    ]
+    if not candidates:
+        return "Other / Unmapped"
+    best = max(candidates, key=lambda tag: (score_collection_tag(tag, tag_counts), tag_counts.get(tag.lower(), 0), tag))
+    if score_collection_tag(best, tag_counts) < MIN_COLLECTION_TAG_SCORE:
+        return "Other / Unmapped"
+    return tag_display.get(best.lower(), best)
 
 
 def detect_product_type(group: pd.DataFrame) -> str:
@@ -401,6 +562,7 @@ class ReportData:
     stocked_products: pd.DataFrame
     type_overview: pd.DataFrame
     collection_overview: pd.DataFrame
+    tag_overview: pd.DataFrame
     metrics: Dict[str, float]
     audit: Dict[str, float]
 
@@ -430,7 +592,11 @@ def load_and_prepare(csv_path: str) -> pd.DataFrame:
     return df
 
 
-def build_inventory_overview(products: pd.DataFrame, group_col: str, empty_label: str) -> pd.DataFrame:
+def build_inventory_overview(
+    products: pd.DataFrame,
+    group_col: str,
+    empty_label: str,
+) -> pd.DataFrame:
     """Build an Afrozeh-style inventory summary by type or collection."""
     rows = []
     if products.empty or group_col not in products.columns:
@@ -444,6 +610,76 @@ def build_inventory_overview(products: pd.DataFrame, group_col: str, empty_label
         rows.append(
             {
                 group_col: label,
+                "Products": int(group["Handle"].nunique()),
+                "With_Stock": int(stocked["Handle"].nunique()),
+                "Available_Units": float(stocked["Units"].sum()),
+                "Current_Value": float(stocked["Exact Retail Value"].sum()),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[group_col, "Products", "With_Stock", "Available_Units", "Current_Value"]
+        )
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values(["Current_Value", "Products"], ascending=[False, False])
+        .reset_index(drop=True)
+    )
+
+
+def product_tags_for_overview(tags: str) -> List[str]:
+    """Return exact product tags for tag-wise collection reporting."""
+    tag_list = []
+    seen = set()
+    for raw_tag in str(tags or "").split(","):
+        tag = clean_text(raw_tag)
+        if not tag:
+            continue
+        key = tag.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        tag_list.append(tag)
+    return tag_list
+
+
+def build_tag_overview(products: pd.DataFrame) -> pd.DataFrame:
+    """Build inventory grouped by each exact Shopify tag.
+
+    A product can appear under multiple tags, so this table is a tag collection
+    view rather than a unique total breakdown.
+    """
+    columns = ["Tag", "Products", "With_Stock", "Available_Units", "Current_Value"]
+    if products.empty or "Tags" not in products.columns:
+        return pd.DataFrame(columns=columns)
+
+    tag_rows = []
+    for _, product in products.iterrows():
+        tags = product_tags_for_overview(product.get("Tags", ""))
+        if not tags:
+            tags = ["No Tag"]
+        for tag in tags:
+            tag_rows.append(
+                {
+                    "Tag": tag,
+                    "Handle": product["Handle"],
+                    "Units": product["Units"],
+                    "Exact Retail Value": product["Exact Retail Value"],
+                }
+            )
+
+    if not tag_rows:
+        return pd.DataFrame(columns=columns)
+
+    expanded = pd.DataFrame(tag_rows)
+    rows = []
+    for tag, group in expanded.groupby("Tag", sort=False, dropna=False):
+        stocked = group[group["Units"] > 0]
+        rows.append(
+            {
+                "Tag": clean_text(tag) or "No Tag",
                 "Products": int(group["Handle"].nunique()),
                 "With_Stock": int(stocked["Handle"].nunique()),
                 "Available_Units": float(stocked["Units"].sum()),
@@ -465,8 +701,10 @@ def build_report_data(csv_path: str) -> ReportData:
     for handle, group in df.groupby("Handle", sort=False):
         title = first_non_empty(group["Title"])
         tags = first_non_empty(group["Tags"])
+        vendor = first_non_empty(group["Vendor"]) if "Vendor" in group.columns else ""
         published = first_non_empty(group["Published"])
         status = first_non_empty(group["Status"])
+        product_type = detect_product_type(group)
 
         qty_total = float(group["_qty"].sum())
         value_exact = float(group["_row_value"].sum())
@@ -484,8 +722,9 @@ def build_report_data(csv_path: str) -> ReportData:
                 "Handle": clean_text(handle),
                 "Title": title,
                 "Tags": tags,
-                "Type": detect_product_type(group),
-                "Collection": detect_collection(tags),
+                "Vendor": vendor,
+                "Type": product_type,
+                "Collection": detect_collection_from_columns(group),
                 "Status": status,
                 "Published": published,
                 "Variant Rows": int(len(group)),
@@ -509,10 +748,50 @@ def build_report_data(csv_path: str) -> ReportData:
         & (products["Published"].apply(normalise_bool) == "true")
     ].copy()
 
+    disallowed_exact_tags: set[str] = set()
+    for value in active_published.get("Vendor", pd.Series(dtype=str)):
+        value = clean_text(value).lower()
+        if value:
+            disallowed_exact_tags.add(value)
+    for value in active_published.get("Type", pd.Series(dtype=str)):
+        value = clean_text(value).lower()
+        if value and value != "no type":
+            disallowed_exact_tags.add(value)
+
+    tag_counts: Dict[str, int] = {}
+    tag_display_counts: Dict[str, Dict[str, int]] = {}
+    for tags in active_published["Tags"]:
+        for tag in product_tags_for_overview(tags):
+            key = tag.lower()
+            tag_counts[key] = tag_counts.get(key, 0) + 1
+            if key not in tag_display_counts:
+                tag_display_counts[key] = {}
+            tag_display_counts[key][tag] = tag_display_counts[key].get(tag, 0) + 1
+
+    tag_display = build_canonical_tag_display(tag_display_counts)
+
+    active_published["Collection"] = active_published.apply(
+        lambda row: row["Collection"] if clean_text(row["Collection"]) else infer_collection_from_tags(
+            row["Tags"],
+            row["Handle"],
+            row["Title"],
+            tag_counts,
+            tag_display,
+            disallowed_exact_tags,
+        ),
+        axis=1,
+    )
+
+    stocked_collection_names = set(active_published.loc[active_published["Units"] > 0, "Collection"])
+    active_published["Collection"] = active_published["Collection"].apply(
+        lambda name: name if name in stocked_collection_names else "Other / Unmapped"
+    )
+
     stocked = active_published[active_published["Units"] > 0].copy()
 
     type_overview = build_inventory_overview(active_published, "Type", "No Type")
     collection_overview = build_inventory_overview(active_published, "Collection", "Other")
+    tag_overview = build_tag_overview(active_published)
 
     metrics = {
         "Active + Published": int(active_published["Handle"].nunique()),
@@ -540,6 +819,7 @@ def build_report_data(csv_path: str) -> ReportData:
         stocked_products=stocked,
         type_overview=type_overview,
         collection_overview=collection_overview,
+        tag_overview=tag_overview,
         metrics=metrics,
         audit=audit,
     )
@@ -784,7 +1064,7 @@ def build_rules_table(styles) -> Table:
         ["Stock filter", "After grouping by Handle, keep only products where total Units > 0."],
         ["Available units", "Sum Variant Inventory Qty across all variant rows for included products."],
         ["Retail value", "Exact formula: SUM(Variant Inventory Qty * Variant Price)."],
-        ["Collection", "Exact tag match from Tags. Example: mini26 is not counted as mini."],
+        ["Collection", "Read from collection columns if the CSV includes them; otherwise shown as Other / Unmapped."],
     ]
     tbl = Table(rows, colWidths=[1.55 * inch, 5.15 * inch])
     tbl.setStyle(table_style())
@@ -856,6 +1136,38 @@ def build_collection_table(report: ReportData, styles) -> Table:
     rows.append(
         [
             p("Total", styles["TinyBold"]),
+            format_int(report.metrics["Active + Published"]),
+            format_int(report.metrics["Products with stock"]),
+            format_int(report.metrics["Available units"]),
+            format_money_millions(report.metrics["Inventory value"]),
+        ]
+    )
+
+    tbl = Table(rows, colWidths=[2.75 * inch, 0.8 * inch, 0.9 * inch, 1.25 * inch, 1.35 * inch], repeatRows=1)
+    style = table_style()
+    style = add_number_alignment(style, [1, 2, 3, 4])
+    last_row = len(rows) - 1
+    style.add("FONTNAME", (0, last_row), (-1, last_row), "Helvetica-Bold")
+    style.add("BACKGROUND", (0, last_row), (-1, last_row), colors.HexColor("#EAF7EE"))
+    tbl.setStyle(style)
+    return tbl
+
+
+def build_tag_collection_table(report: ReportData, styles) -> Table:
+    rows = [["Tag", "Products", "With Stock", "Available Units", "Current Value"]]
+    for _, row in report.tag_overview.iterrows():
+        rows.append(
+            [
+                p(row["Tag"], styles["Tiny"]),
+                format_int(row["Products"]),
+                format_int(row["With_Stock"]),
+                format_int(row["Available_Units"]),
+                format_money_millions(row["Current_Value"]),
+            ]
+        )
+    rows.append(
+        [
+            p("Unique Total", styles["TinyBold"]),
             format_int(report.metrics["Active + Published"]),
             format_int(report.metrics["Products with stock"]),
             format_int(report.metrics["Available units"]),
@@ -1052,15 +1364,18 @@ def make_pdf(
         base = Path(output_pdf).with_suffix("")
         product_csv = str(base) + "_Product_Detail.csv"
         collection_csv = str(base) + "_Collection_Overview.csv"
+        tag_csv = str(base) + "_Tag_Collection_Overview.csv"
 
         product_export = report.stocked_products.copy()
         product_export = product_export.sort_values(["Collection", "Exact Retail Value"], ascending=[True, False])
         product_export.to_csv(product_csv, index=False)
 
         report.collection_overview.to_csv(collection_csv, index=False)
+        report.tag_overview.to_csv(tag_csv, index=False)
 
         print(f"Product detail CSV saved: {product_csv}")
         print(f"Collection overview CSV saved: {collection_csv}")
+        print(f"Tag collection overview CSV saved: {tag_csv}")
 
     return report
 
