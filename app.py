@@ -392,9 +392,22 @@ def infer_collection_from_tags(
 
 
 def detect_product_type(group: pd.DataFrame) -> str:
-    """Detect Shopify product type without using long taxonomy categories."""
-    product_type = first_existing_non_empty(group, TYPE_COLUMN_CANDIDATES, fallback="No Type")
-    return product_type if product_type else "No Type"
+    """Detect Shopify product type universally across any brand."""
+    product_type = first_existing_non_empty(group, TYPE_COLUMN_CANDIDATES, fallback="")
+    
+    if not product_type or product_type.lower() == "no type":
+        return "No Type"
+        
+    # Shopify standard taxonomy often exports as "Apparel & Accessories > Clothing > Shirts"
+    # We split by '>' and take the last part so the report looks clean for ANY brand.
+    if ">" in product_type:
+        product_type = product_type.split(">")[-1].strip()
+        
+    # Capitalize for a clean PDF look if the raw CSV data is lowercase
+    if product_type.islower():
+        return product_type.title()
+        
+    return product_type
 
 
 def format_int(value) -> str:
@@ -480,13 +493,7 @@ def app_base_dir() -> Path:
 
 
 def find_logo_file() -> Optional[Path]:
-    """Find the logo safely on Windows and Linux.
-
-    Windows is usually forgiving about filename case, but Amazon Linux is not.
-    This function checks the app folder, current working folder, and common
-    static folders. It supports png/jpg/jpeg/webp so the app still works if
-    the logo file is not exactly named logo.png.
-    """
+    """Find the logo safely on Windows and Linux."""
     env_logo = os.getenv("BOOSTEREX_LOGO_FILE", "").strip()
     base_dirs = [app_base_dir(), Path.cwd()]
     candidates: List[Path] = []
@@ -513,7 +520,6 @@ def find_logo_file() -> Optional[Path]:
         if resolved.is_file():
             return resolved
 
-    # Last fallback: scan the folders case-insensitively for any file whose stem is "logo".
     scanned_dirs: set[Path] = set()
     allowed_exts = {".png", ".jpg", ".jpeg", ".webp"}
     for base in base_dirs:
@@ -537,12 +543,10 @@ def find_logo_file() -> Optional[Path]:
 
 
 def logo_media_type(path: Path) -> str:
-    """Return the correct media type for the logo response."""
     guessed, _ = mimetypes.guess_type(str(path))
     return guessed or "application/octet-stream"
 
 def build_logo_flowable(max_width: float = 1.10 * inch, max_height: float = 0.70 * inch) -> Optional[RLImage]:
-    """Create a ReportLab image flowable for the PDF logo, if logo exists."""
     logo_path = find_logo_file()
     if not logo_path:
         return None
@@ -579,7 +583,6 @@ def load_and_prepare(csv_path: str) -> pd.DataFrame:
             "CSV is missing required columns: " + ", ".join(missing)
         )
 
-    # Clean key columns
     for col in ["Handle", "Title", "Tags", "Published", "Status"]:
         df[col] = df[col].apply(clean_text)
 
@@ -587,7 +590,6 @@ def load_and_prepare(csv_path: str) -> pd.DataFrame:
     df["_price"] = to_number(df["Variant Price"])
     df["_row_value"] = df["_qty"] * df["_price"]
 
-    # Drop rows without handle, because Handle is the product key
     df = df[df["Handle"].astype(str).str.strip() != ""].copy()
     return df
 
@@ -597,7 +599,6 @@ def build_inventory_overview(
     group_col: str,
     empty_label: str,
 ) -> pd.DataFrame:
-    """Build an Afrozeh-style inventory summary by type or collection."""
     rows = []
     if products.empty or group_col not in products.columns:
         return pd.DataFrame(
@@ -630,7 +631,6 @@ def build_inventory_overview(
 
 
 def product_tags_for_overview(tags: str) -> List[str]:
-    """Return exact product tags for tag-wise collection reporting."""
     tag_list = []
     seen = set()
     for raw_tag in str(tags or "").split(","):
@@ -646,11 +646,6 @@ def product_tags_for_overview(tags: str) -> List[str]:
 
 
 def build_tag_overview(products: pd.DataFrame) -> pd.DataFrame:
-    """Build inventory grouped by each exact Shopify tag.
-
-    A product can appear under multiple tags, so this table is a tag collection
-    view rather than a unique total breakdown.
-    """
     columns = ["Tag", "Products", "With_Stock", "Available_Units", "Current_Value"]
     if products.empty or "Tags" not in products.columns:
         return pd.DataFrame(columns=columns)
@@ -780,11 +775,6 @@ def build_report_data(csv_path: str) -> ReportData:
             disallowed_exact_tags,
         ),
         axis=1,
-    )
-
-    stocked_collection_names = set(active_published.loc[active_published["Units"] > 0, "Collection"])
-    active_published["Collection"] = active_published["Collection"].apply(
-        lambda name: name if name in stocked_collection_names else "Other / Unmapped"
     )
 
     stocked = active_published[active_published["Units"] > 0].copy()
@@ -1298,26 +1288,50 @@ def make_pdf(
     story.append(p("Collection-wise Inventory", styles["SectionTitle"]))
     story.append(build_collection_table(report, styles))
 
+    # ==========================================
+    # SESSION 1: TYPE-WISE PRODUCT DETAIL
+    # ==========================================
     story.append(PageBreak())
-
-    # Product detail by collection
     if products_per_collection is None:
-        heading = "Complete Product Detail - All Stocked Products"
+        type_heading = "Product Detail Session 1: Grouped by Product Type"
     else:
-        heading = f"Top {products_per_collection} Products per Collection - By Exact Retail Value"
+        type_heading = f"Top {products_per_collection} Products by Type - By Exact Retail Value"
 
-    story.append(p(heading, styles["SectionTitle"]))
-    story.append(
-        p(
-            "Products are sorted by exact retail value inside each collection. Exact value uses variant-level quantity multiplied by variant price.",
-            styles["Small"],
-        )
-    )
+    story.append(p(type_heading, styles["ReportTitle"]))
+    story.append(p("Extracted explicitly from the Shopify 'Type' or 'Product Type' columns.", styles["Small"]))
     story.append(Spacer(1, 8))
 
-    collection_order = report.collection_overview[
-        report.collection_overview["With_Stock"] > 0
-    ]["Collection"].tolist()
+    type_order = report.type_overview[report.type_overview["With_Stock"] > 0]["Type"].tolist()
+    for idx, p_type in enumerate(type_order):
+        products = report.stocked_products[report.stocked_products["Type"] == p_type].copy()
+        products = products.sort_values("Exact Retail Value", ascending=False)
+        if products_per_collection is not None:
+            products = products.head(products_per_collection)
+
+        type_row = report.type_overview[report.type_overview["Type"] == p_type].iloc[0]
+        heading_text = (
+            f"Type: {p_type} - {format_money(type_row['Current_Value'])} - "
+            f"{format_int(type_row['Available_Units'])} units - "
+            f"{format_int(type_row['With_Stock'])} stocked products"
+        )
+        story.append(p(heading_text, styles["SectionTitle"]))
+        story.append(build_products_table(products, styles))
+        story.append(Spacer(1, 10))
+
+    # ==========================================
+    # SESSION 2: TAG-WISE COLLECTION DETAIL
+    # ==========================================
+    story.append(PageBreak())
+    if products_per_collection is None:
+        coll_heading = "Product Detail Session 2: Grouped by Tag-Based Collection"
+    else:
+        coll_heading = f"Top {products_per_collection} Products by Tag Collection - By Exact Retail Value"
+
+    story.append(p(coll_heading, styles["ReportTitle"]))
+    story.append(p("Extracted by smart-scanning and filtering the Shopify 'Tags' column.", styles["Small"]))
+    story.append(Spacer(1, 8))
+
+    collection_order = report.collection_overview[report.collection_overview["With_Stock"] > 0]["Collection"].tolist()
     for idx, collection in enumerate(collection_order):
         products = report.stocked_products[report.stocked_products["Collection"] == collection].copy()
         products = products.sort_values("Exact Retail Value", ascending=False)
@@ -1326,17 +1340,13 @@ def make_pdf(
 
         coll_row = report.collection_overview[report.collection_overview["Collection"] == collection].iloc[0]
         heading_text = (
-            f"{collection} - {format_money(coll_row['Current_Value'])} - "
+            f"Collection: {collection} - {format_money(coll_row['Current_Value'])} - "
             f"{format_int(coll_row['Available_Units'])} units - "
             f"{format_int(coll_row['With_Stock'])} stocked products"
         )
         story.append(p(heading_text, styles["SectionTitle"]))
         story.append(build_products_table(products, styles))
         story.append(Spacer(1, 10))
-
-        # Avoid giant pages; add occasional page break
-        if idx < len(collection_order) - 1 and idx % 4 == 3:
-            story.append(PageBreak())
 
     story.append(PageBreak())
 
@@ -1382,12 +1392,6 @@ def make_pdf(
 # =========================
 # FASTAPI WEB FRONTEND
 # =========================
-# Install:
-#   pip install fastapi uvicorn python-multipart pandas reportlab
-# Run:
-#   python boosterex_inventory_web_app.py
-# Open:
-#   http://127.0.0.1:8000
 
 import asyncio
 import uuid
@@ -1417,17 +1421,11 @@ app = FastAPI(title=APP_TITLE)
 
 @app.get("/logo.png")
 async def serve_logo_png():
-    """Backward-compatible logo URL."""
     return await serve_logo_asset()
 
 
 @app.get("/assets/logo")
 async def serve_logo_asset():
-    """Serve the app logo from the app folder/static/assets/images.
-
-    Use this URL in the browser: /assets/logo
-    If it returns 404, the server cannot see your logo file.
-    """
     logo_path = find_logo_file()
     if not logo_path:
         raise HTTPException(
@@ -1442,7 +1440,6 @@ async def serve_logo_asset():
 
 @app.get("/debug/logo")
 async def debug_logo():
-    """Quick check for EC2/Linux: open /debug/logo to see what path the app finds."""
     logo_path = find_logo_file()
     return JSONResponse(
         {
@@ -2110,8 +2107,6 @@ def safe_download_path(file_name: str) -> Path:
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    # This is the refresh cleanup rule: when the frontend page is opened/refreshed,
-    # old generated PDFs are removed to save local server space.
     cleanup_generated_reports()
     return HTMLResponse(INDEX_HTML)
 
@@ -2146,7 +2141,6 @@ async def generate_report(csv_file: UploadFile = File(...)):
     try:
         upload_path.write_bytes(raw)
 
-        # Run PDF creation in a worker thread so the web server stays responsive.
         report = await asyncio.to_thread(
             make_pdf,
             csv_path=str(upload_path),
