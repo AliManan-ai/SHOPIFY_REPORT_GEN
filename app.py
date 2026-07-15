@@ -71,16 +71,89 @@ DEFAULT_API_BASE_URL = os.environ.get(
 DEFAULT_MODEL = os.environ.get("SHOPIFY_REPORT_MODEL", "gpt-5-mini")
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-CACHE_DIR = os.path.join(APP_DIR, ".collection_cache")
+
+# ─── CROSS-PLATFORM / EC2-SAFE DIRECTORY RESOLUTION ─────────────────────────
+# Writing next to the script (APP_DIR) breaks on many real deployments:
+# EC2 systemd services running as a non-owner user, CodeDeploy/CI artifacts
+# owned by root, read-only container filesystems, EFS-mounted code, etc.
+# Windows has an analogous problem when the app is installed under
+# Program Files (admin-only write). So instead of assuming APP_DIR is
+# writable, we try a chain of locations and keep the first one that
+# actually accepts a test file, and never crash at import time.
+#
+# Every directory can also be forced explicitly via an env var — the
+# recommended way to configure this on an EC2 systemd unit or a Windows
+# service:
+#   SHOPIFY_REPORT_CACHE_DIR, SHOPIFY_REPORT_PERMANENT_DIR, SHOPIFY_REPORT_TEMP_DIR
+
+
+def _is_writable_dir(path: str) -> bool:
+    """Create `path` if needed and confirm we can actually write a file there."""
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, f".wtest_{uuid.uuid4().hex}")
+        with open(probe, "w") as fh:
+            fh.write("ok")
+        os.remove(probe)
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_dir(env_var: str, subfolder: str, allow_temp_fallback: bool = True) -> str:
+    """
+    Pick the first writable directory from, in order:
+      1. Explicit override via env var (full path, used as-is)
+      2. APP_DIR/<subfolder>            (original behavior — fine for local/dev)
+      3. ~/.shopify_inventory_report/<subfolder>   (per-user, works on Linux & Windows)
+      4. <system temp>/shopify_inventory_report/<subfolder>  (last resort)
+    Raises only if literally nothing on the machine is writable.
+    """
+    override = os.environ.get(env_var)
+    candidates = []
+    if override:
+        candidates.append(override)
+    candidates.append(os.path.join(APP_DIR, subfolder))
+    candidates.append(os.path.join(os.path.expanduser("~"), ".shopify_inventory_report", subfolder))
+    if allow_temp_fallback:
+        candidates.append(os.path.join(tempfile.gettempdir(), "shopify_inventory_report", subfolder))
+
+    for path in candidates:
+        if _is_writable_dir(path):
+            return path
+
+    raise RuntimeError(
+        f"No writable directory found for {env_var} (subfolder='{subfolder}'). "
+        f"Tried: {candidates}. Set {env_var} to a directory this process can write to."
+    )
+
+
+CACHE_DIR = _resolve_dir("SHOPIFY_REPORT_CACHE_DIR", ".collection_cache")
 # Permanent, version-independent store of AI-learned collection names per
 # brand. Unlike CACHE_DIR (keyed to CACHE_SCHEMA_VERSION and wiped by the
 # "Reset Learning" button), this directory is never cleared automatically
 # and is not exposed anywhere in the frontend/API responses — backend only.
-PERMANENT_DIR = os.path.join(APP_DIR, ".permanent_collections")
-TEMP_JOBS_DIR = os.path.join(tempfile.gettempdir(), "shopify_inventory_jobs")
-os.makedirs(CACHE_DIR, exist_ok=True)
-os.makedirs(PERMANENT_DIR, exist_ok=True)
-os.makedirs(TEMP_JOBS_DIR, exist_ok=True)
+# NOTE: deliberately does NOT fall back to the OS temp dir, since a
+# "permanent" store that silently lands in /tmp defeats its purpose — if the
+# home-directory fallback also fails, fix permissions / set the env var.
+PERMANENT_DIR = _resolve_dir("SHOPIFY_REPORT_PERMANENT_DIR", ".permanent_collections", allow_temp_fallback=False)
+
+_temp_jobs_override = os.environ.get("SHOPIFY_REPORT_TEMP_DIR")
+TEMP_JOBS_DIR = _temp_jobs_override or os.path.join(tempfile.gettempdir(), "shopify_inventory_jobs")
+if not _is_writable_dir(TEMP_JOBS_DIR):
+    # Extremely unlikely (system temp dir itself unwritable), but fail
+    # loudly and clearly rather than crashing deep inside a request handler.
+    raise RuntimeError(
+        f"Temp jobs directory is not writable: {TEMP_JOBS_DIR}. "
+        f"Set SHOPIFY_REPORT_TEMP_DIR to a writable directory."
+    )
+
+print("=" * 60)
+print("  📁 Storage locations in use:")
+print(f"     Cache:     {CACHE_DIR}")
+print(f"     Permanent: {PERMANENT_DIR}")
+print(f"     Temp jobs: {TEMP_JOBS_DIR}")
+print("=" * 60)
 
 JOBS: Dict[str, Dict[str, Any]] = {}
 TEMP_FILE_TTL_MINUTES = 30
@@ -2195,11 +2268,18 @@ async def force_cleanup(
 
 
 if __name__ == "__main__":
+    # On EC2 (or any remote host) this needs to bind 0.0.0.0 to be reachable
+    # at all — 127.0.0.1 only accepts connections from the same machine.
+    # Locally on Windows/macOS 127.0.0.1 is usually what you want, so both
+    # are configurable via env vars rather than hardcoded either way.
+    host = os.environ.get("SHOPIFY_REPORT_HOST", "0.0.0.0")
+    port = int(os.environ.get("SHOPIFY_REPORT_PORT", "8000"))
+
     print("=" * 60)
     print("  🚀 Shopify Inventory Report Pro v4.3.1")
     print("     Handle math • codename collections (Mini26/MiniV2) • low unmapped")
     print("=" * 60)
     print(f"  🧠 Cache: {CACHE_DIR}")
-    print(f"  🌐 http://127.0.0.1:8000")
+    print(f"  🌐 http://{host}:{port}")
     print("=" * 60)
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host=host, port=port)
