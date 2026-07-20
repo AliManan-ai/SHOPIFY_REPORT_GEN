@@ -3,42 +3,28 @@
 ================================================================================
 Shopify Products Export → Collection-Wise Inventory PDF Report Generator (FastAPI)
 ================================================================================
-v4.2 — Universal AI-Powered Collection Detection
-        + Specificity-aware assignment (fixes Nureh-style multi-tag catalogs)
+v4.6 — Website Frontend Collection Alignment & Zero Sale/Clearance Fallback
 
-Why v4.2 (the Nureh bug):
-  Pakistani fashion stores (Nureh and similar) put BOTH a parent bucket tag
-  ("Nureh Unstitched", "Nureh Pret", "Casual Pret") AND a real named collection
-  ("Gardenia", "Shades Of Summer", "Maya", "Daily Delights") on every product.
-
-  v4.1 assigned each product to the FIRST of its tags that the AI marked as a
-  collection. Shopify tag order is arbitrary, so parent buckets almost always
-  won — producing giant fake collections like "Nureh Unstitched (248)" while the
-  real lines (Gardenia, Maya, …) looked tiny or missing.
-
-  v4.2 keeps AI classification, but when a product has multiple collection
-  tags it picks the MOST SPECIFIC one (lowest product frequency across the
-  catalog). Parent buckets only win when no named line is present.
-
-Architecture:
-  Phase 1: Fast Local Analysis — Extract unique tags, filter universal noise
-           (sizes, fabrics, codes, dates, prices) + per-brand ignore list.
-  Phase 2: Brand-scoped cache lookup.
-  Phase 3: AI Classification — ALL uncached candidates, batched. Both positive
-           and negative verdicts are cached.
-  Phase 4: Specificity-aware assignment — among a product's tags that resolved
-           to real collections, choose the rarest (most specific). No parent
-           bucket can override a named line.
-
-Usage:
-    python3 app.py
-    # Open http://127.0.0.1:8000
+Changes in v4.6:
+  1. Complete removal of the 'Sale / Clearance' dummy collection bucket. Discount/sale tags
+     (e.g., 'Flat 20%', 'Sale collection') are treated as promo filters; products are mapped
+     directly to their real brand collection line.
+  2. Enhanced Brand Prefix & Title/Tag Fallback Engine matching website frontend collections
+     (Nureh, Afrozeh, Ziva, and other major Pakistani and international brands).
+     e.g., SP- -> Shades of Summer, DD- -> Daily Delights, NR- -> Raha, AM- -> Amaya,
+     MK- -> Mukeshkari, TW- -> Tiny Twinkles, NP- -> Casual Pret, FE- -> Fancy Formal,
+     NEL- -> Chiffon Luxe, NSG- -> Gardenia, NS- -> Maya.
+  3. Improved SKU/Code Noise filtering for letter+digit codes (NU2-203, NE-113-Trouser, FP-112-SIZECHAT).
+  4. Normalized all-caps brand tags (MAYA -> Maya, INAMS -> Inams, EVERYDAY PRET -> Everyday Pret)
+     while keeping exact casing for hyphenated brand codes (K&G-TShirts&Polo).
 """
 
-import os, sys, csv, json, re, uuid, shutil, hashlib, tempfile, time
+import os, sys, csv, json, re, uuid, shutil, hashlib, tempfile, time, html
 from datetime import datetime, timedelta
 from collections import defaultdict, Counter
 from typing import Optional, Dict, Any, List, Set, Tuple
+from xml.sax.saxutils import escape as xml_escape
+from difflib import SequenceMatcher
 
 try:
     from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks, Query
@@ -61,6 +47,7 @@ except ImportError as e:
     sys.exit(1)
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
+
 DEFAULT_API_KEY = os.environ.get(
     "SHOPIFY_REPORT_API_KEY",
     "sk-8DLeSnmkFU4lOjPQtwwDTwYlKdLw3ikVHmt9hFzIgCsCIttE",
@@ -72,23 +59,10 @@ DEFAULT_MODEL = os.environ.get("SHOPIFY_REPORT_MODEL", "gpt-5-mini")
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# ─── CROSS-PLATFORM / EC2-SAFE DIRECTORY RESOLUTION ─────────────────────────
-# Writing next to the script (APP_DIR) breaks on many real deployments:
-# EC2 systemd services running as a non-owner user, CodeDeploy/CI artifacts
-# owned by root, read-only container filesystems, EFS-mounted code, etc.
-# Windows has an analogous problem when the app is installed under
-# Program Files (admin-only write). So instead of assuming APP_DIR is
-# writable, we try a chain of locations and keep the first one that
-# actually accepts a test file, and never crash at import time.
-#
-# Every directory can also be forced explicitly via an env var — the
-# recommended way to configure this on an EC2 systemd unit or a Windows
-# service:
-#   SHOPIFY_REPORT_CACHE_DIR, SHOPIFY_REPORT_PERMANENT_DIR, SHOPIFY_REPORT_TEMP_DIR
+# ─── CROSS-PLATFORM DIRECTORY RESOLUTION ──────────────────────────────────────
 
-
-def _is_writable_dir(path: str) -> bool:
-    """Create `path` if needed and confirm we can actually write a file there."""
+def is_writable_dir(path: str) -> bool:
+    """Create `path` if needed and confirm we can write a file there."""
     try:
         os.makedirs(path, exist_ok=True)
         probe = os.path.join(path, f".wtest_{uuid.uuid4().hex}")
@@ -99,16 +73,7 @@ def _is_writable_dir(path: str) -> bool:
     except Exception:
         return False
 
-
-def _resolve_dir(env_var: str, subfolder: str, allow_temp_fallback: bool = True) -> str:
-    """
-    Pick the first writable directory from, in order:
-      1. Explicit override via env var (full path, used as-is)
-      2. APP_DIR/<subfolder>            (original behavior — fine for local/dev)
-      3. ~/.shopify_inventory_report/<subfolder>   (per-user, works on Linux & Windows)
-      4. <system temp>/shopify_inventory_report/<subfolder>  (last resort)
-    Raises only if literally nothing on the machine is writable.
-    """
+def resolve_dir(env_var: str, subfolder: str, allow_temp_fallback: bool = True) -> str:
     override = os.environ.get(env_var)
     candidates = []
     if override:
@@ -119,34 +84,20 @@ def _resolve_dir(env_var: str, subfolder: str, allow_temp_fallback: bool = True)
         candidates.append(os.path.join(tempfile.gettempdir(), "shopify_inventory_report", subfolder))
 
     for path in candidates:
-        if _is_writable_dir(path):
+        if is_writable_dir(path):
             return path
-
     raise RuntimeError(
         f"No writable directory found for {env_var} (subfolder='{subfolder}'). "
         f"Tried: {candidates}. Set {env_var} to a directory this process can write to."
     )
 
+CACHE_DIR = resolve_dir("SHOPIFY_REPORT_CACHE_DIR", ".collection_cache")
+PERMANENT_DIR = resolve_dir("SHOPIFY_REPORT_PERMANENT_DIR", ".permanent_collections", allow_temp_fallback=False)
 
-CACHE_DIR = _resolve_dir("SHOPIFY_REPORT_CACHE_DIR", ".collection_cache")
-# Permanent, version-independent store of AI-learned collection names per
-# brand. Unlike CACHE_DIR (keyed to CACHE_SCHEMA_VERSION and wiped by the
-# "Reset Learning" button), this directory is never cleared automatically
-# and is not exposed anywhere in the frontend/API responses — backend only.
-# NOTE: deliberately does NOT fall back to the OS temp dir, since a
-# "permanent" store that silently lands in /tmp defeats its purpose — if the
-# home-directory fallback also fails, fix permissions / set the env var.
-PERMANENT_DIR = _resolve_dir("SHOPIFY_REPORT_PERMANENT_DIR", ".permanent_collections", allow_temp_fallback=False)
-
-_temp_jobs_override = os.environ.get("SHOPIFY_REPORT_TEMP_DIR")
-TEMP_JOBS_DIR = _temp_jobs_override or os.path.join(tempfile.gettempdir(), "shopify_inventory_jobs")
-if not _is_writable_dir(TEMP_JOBS_DIR):
-    # Extremely unlikely (system temp dir itself unwritable), but fail
-    # loudly and clearly rather than crashing deep inside a request handler.
-    raise RuntimeError(
-        f"Temp jobs directory is not writable: {TEMP_JOBS_DIR}. "
-        f"Set SHOPIFY_REPORT_TEMP_DIR to a writable directory."
-    )
+temp_jobs_override = os.environ.get("SHOPIFY_REPORT_TEMP_DIR")
+TEMP_JOBS_DIR = temp_jobs_override or os.path.join(tempfile.gettempdir(), "shopify_inventory_jobs")
+if not is_writable_dir(TEMP_JOBS_DIR):
+    raise RuntimeError(f"Temp jobs directory is not writable: {TEMP_JOBS_DIR}.")
 
 print("=" * 60)
 print("  📁 Storage locations in use:")
@@ -157,10 +108,181 @@ print("=" * 60)
 
 JOBS: Dict[str, Dict[str, Any]] = {}
 TEMP_FILE_TTL_MINUTES = 30
+CACHE_SCHEMA_VERSION = "v9"
 
-# Bump whenever classification / assignment logic changes so old cache entries
-# (e.g. parent buckets wrongly treated as the only collections) are ignored.
-CACHE_SCHEMA_VERSION = "v7"
+# ─── UNIVERSAL VENDOR DETECTION ENGINE ───────────────────────────────────────
+
+NOISE_VENDORS = {
+    'express shipping', 'express shipping ⚡', 'express_shipping', 'express-shipping',
+    'free shipping', 'shopify', 'my store', 'mystore', 'default vendor', 'default',
+    'admin', 'unknown', 'null', 'none', 'n/a', 'na', '-', '1', 'test', 'sample',
+    'demo', 'b', 'acme', 'generic', 'vendor', 'shop', 'store', 'my-store', 'brand',
+    'company', 'shopify store'
+}
+
+DOMAIN_TLD_PATTERN = re.compile(
+    r'(\.com\.pk|\.co\.uk|\.com|\.pk|\.co|\.store|\.official|\.shop|\.net|\.org|\.io)\b',
+    re.I
+)
+
+OFFICIAL_SUFFIX_PATTERN = re.compile(
+    r'\s+(official(\s+store)?|online(\s+store)?|pvt\s+ltd|pvt|ltd|pk|pakistan|store)$',
+    re.I
+)
+
+TAG_VENDOR_PREFIX = re.compile(r'^(vendor|brand)\s*[:=]\s*(.+)$', re.I)
+
+PARENT_BRAND_TAG_PATTERN = re.compile(
+    r'^([A-Z0-9a-z\s]+?)\s+(unstitched|pret|exclusive|luxury\s*pret|collection|official)$',
+    re.I
+)
+
+def clean_vendor_display(raw: str) -> str:
+    """Strip website domain extensions, boilerplate brand suffixes, and trim punctuation."""
+    if not raw:
+        return ''
+    s = raw.strip()
+    if s.lower() in NOISE_VENDORS:
+        return ''
+    s = DOMAIN_TLD_PATTERN.sub('', s)
+    s = OFFICIAL_SUFFIX_PATTERN.sub('', s)
+    s = s.strip(' ._-\t\r\n')
+    if len(s) <= 1 or s.lower() in NOISE_VENDORS:
+        return ''
+    return s
+
+def normalize_vendor_key(clean_str: str) -> str:
+    """Normalize vendor string for fuzzy grouping by stripping spaces and symbols."""
+    return re.sub(r'[^a-z0-9]', '', clean_str.lower())
+
+def format_brand_name(name: str) -> str:
+    """Format detected brand name nicely into Title Case unless short acronym."""
+    if not name:
+        return 'Shopify Store'
+    name = name.strip()
+    if name.isupper() and len(name) > 3:
+        return name.title()
+    if name.islower():
+        return name.title()
+    return name
+
+def detect_brand(by_handle: Dict[str, Dict[str, Any]], brand_override: Optional[str] = None) -> str:
+    if brand_override and brand_override.strip():
+        return brand_override.strip()
+
+    active_handle_vendors = []
+    all_handle_vendors = []
+
+    for h, p in by_handle.items():
+        v_raw = (p.get('vendor') or '').strip()
+        status = (p.get('status') or '').strip().lower()
+        published = (p.get('published') or '').strip().lower()
+
+        is_active_pub = (status == 'active' and published == 'true')
+
+        if v_raw:
+            cleaned = clean_vendor_display(v_raw)
+            if cleaned:
+                if is_active_pub:
+                    active_handle_vendors.append(cleaned)
+                all_handle_vendors.append(cleaned)
+
+    target_list = active_handle_vendors if active_handle_vendors else all_handle_vendors
+
+    if target_list:
+        key_counts = Counter()
+        key_display_variants = defaultdict(Counter)
+
+        for v in target_list:
+            k = normalize_vendor_key(v)
+            if k:
+                key_counts[k] += 1
+                key_display_variants[k][v] += 1
+
+        if key_counts:
+            sorted_keys = key_counts.most_common()
+            merged_counts = Counter(key_counts)
+
+            for i in range(len(sorted_keys)):
+                k1, count1 = sorted_keys[i]
+                if merged_counts[k1] == 0:
+                    continue
+                for j in range(i + 1, len(sorted_keys)):
+                    k2, count2 = sorted_keys[j]
+                    if merged_counts[k2] == 0:
+                        continue
+                    ratio = SequenceMatcher(None, k1, k2).ratio()
+                    if ratio >= 0.85:
+                        merged_counts[k1] += merged_counts[k2]
+                        merged_counts[k2] = 0
+
+            best_key = merged_counts.most_common(1)[0][0]
+
+            variants = key_display_variants[best_key]
+            best_display = max(
+                variants.keys(),
+                key=lambda var: (
+                    ' ' in var,
+                    variants[var],
+                    not var.islower(),
+                    len(var)
+                )
+            )
+            return format_brand_name(best_display)
+
+    vendor_tag_counts = Counter()
+    parent_tag_counts = Counter()
+
+    for h, p in by_handle.items():
+        status = (p.get('status') or '').strip().lower()
+        published = (p.get('published') or '').strip().lower()
+        if status != 'active' or published != 'true':
+            continue
+        tags_raw = p.get('tags_raw') or ''
+        if not tags_raw:
+            continue
+        tags = [t.strip() for t in tags_raw.split(',') if t.strip()]
+        for t in tags:
+            m_prefix = TAG_VENDOR_PREFIX.match(t)
+            if m_prefix:
+                v_val = m_prefix.group(2).strip()
+                if v_val and v_val.lower() not in NOISE_VENDORS:
+                    vendor_tag_counts[v_val] += 1
+                continue
+            m_parent = PARENT_BRAND_TAG_PATTERN.match(t)
+            if m_parent:
+                b_name = m_parent.group(1).strip()
+                if len(b_name) >= 3 and b_name.lower() not in ('casual', 'formal', 'fancy', 'daily', 'summer', 'winter', 'festive'):
+                    parent_tag_counts[b_name] += 1
+
+    if vendor_tag_counts:
+        return format_brand_name(vendor_tag_counts.most_common(1)[0][0])
+    if parent_tag_counts:
+        return format_brand_name(parent_tag_counts.most_common(1)[0][0])
+
+    return 'Shopify Store'
+
+# ─── BRAND SKU & HANDLE PREFIX MAPPING TABLE ──────────────────────────────────
+
+BRAND_PREFIX_COLLECTION_MAP = {
+    'SP': 'Shades of Summer',
+    'DD': 'Daily Delights',
+    'AM': 'Amaya',
+    'NR': 'Raha',
+    'MK': 'Mukeshkari',
+    'TW': 'Tiny Twinkles',
+    'BL': 'Ballerina',
+    'NP': 'Casual Pret',
+    'FE': 'Fancy Formal',
+    'FP': 'Formal Pret',
+    'NE': 'Nureh Exclusive',
+    'NEL': 'Chiffon Luxe',
+    'NSG': 'Gardenia',
+    'NS': 'Maya',
+    'NW': 'Shades of Winter',
+    'NL': 'Nureh Lawn',
+    'NU2': 'Unstitched',
+}
 
 # ─── UNIVERSAL TAG FILTER ENGINE ─────────────────────────────────────────────
 
@@ -191,22 +313,13 @@ SUBBRAND_PATTERN = re.compile(
     r')$', re.I
 )
 
-# Product / SKU codes only — NOT collection names like mini26, miniv2, Pret26,
-# grown2. Real SKUs almost always use a separator (NP-796, DD-38) or a letter
-# prefix + multi-digit number with optional garment suffix.
-# Collection codenames that glue a short word + year/version (mini26, Pret26,
-# grown2, Noirae26) must NOT match.
 PRODUCT_CODE_PATTERN = re.compile(
-    r'^[a-z]{1,5}[-_]\s?\d{1,5}'  # requires separator: NP-796, DD-38
-    r'(\s+(shirt|trouser|trousers|frock|dupatta|shawl|kurta|kameez))?'
-    r'([-_](sizechart|chart))?\s*$', re.I
+    r'^[a-z0-9]{1,6}[-_]\s?\d{1,5}'
+    r'([\s\-_]+(shirt|trouser|trousers|frock|dupatta|shawl|kurta|kameez))?'
+    r'([-_](sizechart|chart|sizechat))?\s*$', re.I
 )
 
-# Bare codes WITH separator only (NP-796). Glued words like mini26 stay as candidates.
-BARE_CODE_PATTERN = re.compile(r'^[a-z]{1,5}[-_]\d{1,5}$', re.I)
-
-# Optional: pure letter+digit SKUs without separator only when they look like
-# classic codes (2-3 letters + 3+ digits: NP796, FE240) — not mini26 (4+ letters + 2 digits).
+BARE_CODE_PATTERN = re.compile(r'^[a-z0-9]{1,6}[-_]\d{1,5}$', re.I)
 STRICT_GLUED_SKU_PATTERN = re.compile(r'^[a-z]{1,3}\d{3,5}$', re.I)
 
 DATE_PATTERNS = [
@@ -215,8 +328,6 @@ DATE_PATTERNS = [
     re.compile(r'^\d{1,2}\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{2,4}$', re.I),
     re.compile(r'^\d{1,2}[a-z]+\d{2,4}[-_]file$', re.I),
     re.compile(r'^\d{1,2}(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\d{0,2}$', re.I),
-    # Batch / drop date codes common in PK fashion CSVs:
-    # "13-JUNE-26", "1-MARCH-26-SS", "10-May-26 (shades)", "25 FEB 2025"
     re.compile(
         r'^\d{1,2}[-/\s](jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*'
         r'[-/\s]?\d{2,4}(\s*\([^)]*\))?([-_][a-z]{1,6})?$', re.I
@@ -227,7 +338,7 @@ DATE_PATTERNS = [
 PRICE_PATTERNS = [
     re.compile(r'^\d+[\s\-–]+\d+(\s*(pkr|rs|usd|£|\$))?$', re.I),
     re.compile(r'^\d{3,5}\s*(rs|pkr|usd|£|\$)$', re.I),
-    re.compile(r'^\d{3,6}$'),  # Pure numbers 100-999999 are usually prices
+    re.compile(r'^\d{3,6}$'),
 ]
 
 SALE_PATTERNS = [
@@ -260,21 +371,18 @@ OPERATIONAL_PATTERNS = [
     re.compile(r'^rev-?\d+%', re.I),
     re.compile(r'^\d+%?\s*(off|sale|hs)', re.I),
     re.compile(r'^[a-z]{1,2}[-_]?[a-z]$', re.I),
-    # Internal / warehouse / multi-store sync markers (very common in PK multi-brand CSVs)
-    re.compile(r'^ppd[-_]?[a-z0-9]+$', re.I),          # PPD-ELGBL, PPD-EX
+    re.compile(r'^ppd[-_]?[a-z0-9]+$', re.I),
     re.compile(r'^nada[-_]?hidden$', re.I),
     re.compile(r'^newh$', re.I),
-    re.compile(r'^bh\d*$', re.I),                        # BH, BH30
+    re.compile(r'^bh\d*$', re.I),
     re.compile(r'^inc\d+$', re.I),
-    re.compile(r'^(n[-_]?p|n[-_]?h)$', re.I),            # N-P, N-H
-    re.compile(r'^(esgcc|rtsgcc)[-_\s].+$', re.I),       # export batch codes
+    re.compile(r'^(n[-_]?p|n[-_]?h)$', re.I),
+    re.compile(r'^(esgcc|rtsgcc)[-_\s].+$', re.I),
     re.compile(r'^today\s*\d+$', re.I),
-    # Bare season words (after * / _ strip) — not named lines like "Shades of Winter"
     re.compile(r'^(summer|winter|spring|fall|autumn|summerr)$', re.I),
     re.compile(r'^pink$', re.I),
     re.compile(r'^shawls$', re.I),
     re.compile(r'^h$', re.I),
-    # Afrozeh / multi-brand ops & UI notes
     re.compile(r'^ymq[_-]?size$', re.I),
     re.compile(r'^(stitched|unstitched)[_-]?note$', re.I),
     re.compile(r'^hide\s*cod\s*variants?$', re.I),
@@ -286,11 +394,10 @@ OPERATIONAL_PATTERNS = [
     re.compile(r'^products?[_-]?from[_-]?sheet$', re.I),
     re.compile(r'^(bridal[_-]?disclaimer|lining[_-]?option|lining[-_]?note|custom[_-]?flow)$', re.I),
     re.compile(r'^self$', re.I),
-    re.compile(r'^slate$', re.I),  # internal grade/filter, not a collection line
+    re.compile(r'^slate$', re.I),
     re.compile(r'^lehnga[_-]?maxi$', re.I),
     re.compile(r'.*sizechart.*', re.I),
     re.compile(r'.*c\s*category\s*products?$', re.I),
-    # Compact date+sale labels: "27-12-2023_SALE-UPTO30%", "24-7-2023-SALE", "8july2025", "20June25"
     re.compile(r'^\d{1,2}[-/]\d{1,2}[-/]\d{2,4}.*sale.*$', re.I),
     re.compile(r'^\d{1,2}(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\d{2,4}$', re.I),
     re.compile(r'^\d{1,2}[-_]?\d{1,2}[-_]?\d{2,4}[-_]?sale.*$', re.I),
@@ -306,14 +413,12 @@ GARMENT_TYPE_PATTERN = re.compile(
     r'dresses?|suit|suits)$', re.I
 )
 
-# Audience / marketing / channel tags that are NEVER the inventory collection
-# line (universal across fashion stores).
 AUDIENCE_MARKETING_PATTERN = re.compile(
     r'^(women|womens?|womenswear|ladies|men|mens|girls?|boys?|kids?|kidswear|'
     r'baby|unisex|adult|'
     r'bestseller|best\s*seller|best\s*selling|featured|trending|popular|'
     r'new|new\s*in|new\s*arrival[s]?|newin|newarival|arrivals?|'
-    r'summers?|winters?|springs?|autumns?|falls?|'  # bare season only
+    r'summers?|winters?|springs?|autumns?|falls?|'
     r'luxury|premium|sale|clearance|dot\s*sale|red\s*dot|reddot|'
     r'rtw|ready\s*to\s*wear|unstitch|unstitched|'
     r'em[_-]?hidecod|hidecod|hide\s*cod|'
@@ -321,22 +426,17 @@ AUDIENCE_MARKETING_PATTERN = re.compile(
     r'reduced|add\d+|logoall|logo)$', re.I
 )
 
-# Color / filter attribute tags (very common on footwear & accessories stores)
 COLOR_ATTR_PATTERN = re.compile(
     r'^(color[_-].+|colour[_-].+|'
     r'black|brown|blue|green|grey|gray|maroon|beige|red|white|orange|'
     r'camel|coffee|mustard|olive|purple|yellow|apricot|mix|mixed)$', re.I
 )
 
-# Promo / channel / internal prefix tags (RD_*, add5, sale buckets)
 PROMO_CHANNEL_PATTERN = re.compile(
     r'^(rd[_-].+|add\d+|b1g1|flashdeal|lastpair|reduced|'
     r'newarival|newarrival|mkd|mz)$', re.I
 )
 
-# Map Shopify "Type" / product-type strings → clean collection names that match
-# how footwear & lifestyle stores organize their shop (e.g. logoofficial.com).
-# Used as a strong candidate when tags are mostly color/promo noise.
 PRODUCT_TYPE_COLLECTION_MAP = {
     'formal shoes': 'Loafers & Lace Up',
     'premium formal': 'Loafers & Lace Up',
@@ -389,7 +489,6 @@ PRODUCT_TYPE_COLLECTION_MAP = {
     'wearable acc': 'Wearable Accessories',
 }
 
-# Tags that ARE real shop sections for footwear/accessories (prefer over Type mega)
 SPECIFIC_ACCESSORY_TAGS = {
     'socks': 'Socks',
     'belt': 'Belts',
@@ -428,83 +527,57 @@ SPECIFIC_ACCESSORY_TAGS = {
     'slipper': 'Slippers',
 }
 
-# Parent / channel / mega-category tags. Still valid collections when a product
-# has nothing more specific, but they must NEVER beat a named product line.
-# Matched case-insensitively after stripping decorative * _ wrappers.
-# IMPORTANT: every alternative must require at least one real word (no all-optional groups).
 PARENT_BUCKET_PATTERN = re.compile(
     r'^('
     r'(nureh|afrozeh|ziva)\s+(unstitched|pret|exclusive|luxury\s*pret|collection)|'
     r'(nureh|afrozeh|ziva)\s+collection|'
-    r'afrozeh|nureh|ziva|'  # bare brand name as mega-bucket
+    r'afrozeh|nureh|ziva|'
     r'casual\s*pret|formal\s*pret|fancy\s*formal|fancy\s*formals|'
     r'exclusive|pret|unstitched|luxury\s*pret|'
     r'wedding\s*formals?|'
     r'chiffon\s*luxe|'
-    # Occasion / channel mega-buckets (still real, but less specific than named lines)
     r'festive(\s*(edit|collection|wear|formals?))?|'
     r'new\s*in(\s*\d{2,4})?|new\s*arrivals?(\s*\d{2,4})?|newarrivals?\d{0,4}|'
     r'peshwas?\s*&\s*lehngas?|lehngas?\s*&\s*peshwas?|'
-    r'mini\s*me\s*kids?'  # audience sub-line under Mini, not the Mini collection itself
+    r'mini\s*me\s*kids?'
     r')$', re.I
 )
 
-# Occasion / seasonal / mega shop sections. Recover if AI says NOISE, but keep as
-# parent-priority so named lines still win. IMPORTANT: do NOT put named RTW lines
-# like "Basic Pret '26" or "Cords Pret 2026" here — those are real collections
-# on brands like Afrozeh (ready-to-wear edits), not generic parents.
 OCCASION_CATEGORY_PATTERN = re.compile(
     r'^('
     r'festive(\s*(edit|collection|wear|formals?))?|'
     r'eid(\s*edit)?|'
     r'wedding(\s*formals?)?|'
     r'luxury\s*(pret|lawn|formals?)|'
-    # Bare "basic pret" / "cords pret" WITHOUT year = generic channel only.
-    # With year/edit ("Basic Pret '26", "Cords Pret 2026") is a NAMED collection.
     r'basic\s*pret$|'
     r'cords?\s*pret$|'
     r'new\s*in(\s*\d{2,4})?|new\s*arrivals?(\s*\d{2,4})?|newarrivals?\d{0,4}'
     r')$', re.I
 )
 
-# Internal batch / warehouse / UI tags common on multi-brand PK exports
 BATCH_INTERNAL_PATTERN = re.compile(
     r'^('
-    r'bx\s*\d+|'                    # BX 26 internal batch
+    r'bx\s*\d+|'
     r'cart[-_]?button[-_]?hider|'
     r'collection\s*products?|'
-    r'[a-z0-9]+-sc$'                # Soan-sc, Nyrella-sc style/size-chart codes
+    r'[a-z0-9]+-sc$'
     r')$', re.I
 )
 
-
-def _strip_tag_wrappers(tag: str) -> str:
+def strip_tag_wrappers(tag: str) -> str:
     """Normalize decorative wrappers merchants put around tags (*MAYA*, _MAYA)."""
     t = tag.strip()
     t = t.strip('*').strip('_').strip()
     return t
 
-
 def is_noise_tag(tag: str) -> Tuple[bool, str]:
-    """
-    Universal noise detection. Returns (is_noise, category).
-    Works for ANY brand, not just one specific store.
-
-    Tags wrapped in * or _ (e.g. *MAYA*, _Winter) are evaluated on their
-    cleaned core. A real collection name wrapped for admin convenience
-    (*MAYA*) is kept; a bare season word wrapped (*Winter*) is still noise.
-    """
     raw = tag.strip()
     if not raw:
         return True, 'empty'
-
-    # Always judge the cleaned core so *MAYA* / _MAYA survive as "Maya"
-    # while *Winter* / _Shawls still die as season/ops noise.
-    core = _strip_tag_wrappers(raw)
+    core = strip_tag_wrappers(raw)
     t = core.lower()
     if not t:
         return True, 'empty'
-
     if SIZE_PATTERN.match(t):
         return True, 'size'
     if FABRIC_PATTERN.match(t):
@@ -527,7 +600,6 @@ def is_noise_tag(tag: str) -> Tuple[bool, str]:
         return True, 'promo_channel'
     if BATCH_INTERNAL_PATTERN.match(t) or BATCH_INTERNAL_PATTERN.match(core):
         return True, 'batch_internal'
-
     for pat in DATE_PATTERNS:
         if pat.match(t):
             return True, 'date'
@@ -540,32 +612,21 @@ def is_noise_tag(tag: str) -> Tuple[bool, str]:
     for pat in OPERATIONAL_PATTERNS:
         if pat.match(t) or pat.match(core):
             return True, 'operational'
-
     if len(t) <= 2:
         return True, 'too_short'
-
     return False, ''
-
 
 def parse_tags(tags_raw: str) -> List[str]:
     if not tags_raw:
         return []
     return [t.strip() for t in tags_raw.split(',') if t.strip()]
 
-
 def extract_candidate_tags(tags: List[str], ignore: Optional[Set[str]] = None) -> List[str]:
-    """Extract tags that might be collection names (after filtering noise
-    and anything the user asked to ignore for this brand). Preserves the
-    original order the tags appeared in on the product.
-
-    Decorative * / _ wrappers are stripped so *MAYA* and MAYA collapse to
-    the same candidate key downstream.
-    """
     ignore = ignore or set()
     out = []
     seen = set()
     for t in tags:
-        cleaned = _strip_tag_wrappers(t).strip()
+        cleaned = strip_tag_wrappers(t).strip()
         if not cleaned:
             continue
         key = cleaned.lower()
@@ -579,17 +640,10 @@ def extract_candidate_tags(tags: List[str], ignore: Optional[Set[str]] = None) -
         out.append(cleaned)
     return out
 
-
 def is_named_year_collection(tag: str) -> bool:
-    """True for named RTW/seasonal edits like Basic Pret '26, Cords Pret 2026.
-
-    These look a bit like generic pret channels but ARE real collections on
-    Afrozeh and similar brands. Must never be treated as parent-only.
-    """
-    clean = _strip_tag_wrappers(tag).strip()
+    clean = strip_tag_wrappers(tag).strip()
     if not clean:
         return False
-    # "Basic Pret '26", "Basic Pret 26", "Basicpret25", "Cords Pret 2026"
     if re.match(
         r'^(basic|cords?|everyday|casual|formal|fancy)\s*pret\s*[\'’"]?\s*\d{2,4}$',
         clean, re.I,
@@ -599,10 +653,8 @@ def is_named_year_collection(tag: str) -> bool:
         return True
     return False
 
-
 def is_parent_bucket(tag: str) -> bool:
-    clean = _strip_tag_wrappers(tag).strip()
-    # Named year-edits are collections, not parents
+    clean = strip_tag_wrappers(tag).strip()
     if is_named_year_collection(clean):
         return False
     return bool(
@@ -610,47 +662,34 @@ def is_parent_bucket(tag: str) -> bool:
         or OCCASION_CATEGORY_PATTERN.match(clean)
     )
 
-
 def is_recoverable_occasion_tag(tag: str) -> bool:
-    """True for occasion/channel categories AI sometimes marks NOT_COLLECTION.
-
-    Also recovers named year-edits (Basic Pret '26) if the model rejects them.
-    """
-    clean = _strip_tag_wrappers(tag).strip()
+    clean = strip_tag_wrappers(tag).strip()
     if is_named_year_collection(clean):
         return True
     return bool(OCCASION_CATEGORY_PATTERN.match(clean) or PARENT_BUCKET_PATTERN.match(clean))
 
-
 def map_product_type_to_collection(product_type: str) -> Optional[str]:
-    """Map Shopify Product Type → shop collection name (footwear / lifestyle)."""
     if not product_type:
         return None
     key = product_type.strip().lower()
     if key in PRODUCT_TYPE_COLLECTION_MAP:
         return PRODUCT_TYPE_COLLECTION_MAP[key]
-    # fuzzy: strip punctuation
     key2 = re.sub(r'[^a-z0-9\s&]+', '', key).strip()
     if key2 in PRODUCT_TYPE_COLLECTION_MAP:
         return PRODUCT_TYPE_COLLECTION_MAP[key2]
     return None
 
-
 def map_specific_tag_to_collection(tag: str) -> Optional[str]:
-    """Map a known accessory/category tag → clean collection name."""
     if not tag:
         return None
-    key = _strip_tag_wrappers(tag).strip().lower()
+    key = strip_tag_wrappers(tag).strip().lower()
     return SPECIFIC_ACCESSORY_TAGS.get(key)
-
 
 # ─── UNIVERSAL COLLECTION DETECTION ENGINE ───────────────────────────────────
 
+ACRONYMS = {'RTW', 'K&G', 'K&B', 'B&K', 'PPD', 'AIS', 'USA', 'UK', 'UAE', 'PKR'}
+
 class CollectionDetector:
-    """
-    Universal collection detection that works for any brand.
-    Uses local analysis + AI classification + specificity-aware assignment.
-    """
 
     def __init__(self, api_key=None, api_base_url=None, model=None):
         self.api_key = api_key or DEFAULT_API_KEY
@@ -671,7 +710,6 @@ class CollectionDetector:
         import traceback
         try:
             self.client = OpenAI(api_key=self.api_key, base_url=self.api_base_url)
-            # Track WHY use_ai fell back, so it's visible to the caller/UI
             self.init_error = None
         except Exception as e:
             print("=" * 60)
@@ -700,44 +738,48 @@ class CollectionDetector:
                     try:
                         with open(os.path.join(CACHE_DIR, f), 'r') as fh:
                             d = json.load(fh)
-                            cache[d['key']] = d['value']
+                            val = d['value']
+                            if val and val != 'NOT_COLLECTION':
+                                val = self._normalize_name(val)
+                            cache[d['key']] = val
                     except Exception:
                         pass
         return cache
 
     def _save_cache(self, key: str, value: str):
-        self.cache[key] = value
+        norm_val = value if value == 'NOT_COLLECTION' else self._normalize_name(value)
+        self.cache[key] = norm_val
         try:
             with open(self._cache_path(key), 'w') as f:
                 json.dump(
-                    {'key': key, 'value': value, 'ts': datetime.now().isoformat()},
+                    {'key': key, 'value': norm_val, 'ts': datetime.now().isoformat()},
                     f,
                 )
         except Exception:
             pass
 
-    # ── Permanent per-brand store (backend only, never cleared) ────────────
     def _permanent_path(self, brand_slug: str) -> str:
         return os.path.join(PERMANENT_DIR, f"{brand_slug}.json")
 
     def _load_permanent(self, brand_slug: str) -> Dict[str, Any]:
-        """
-        tag_lower -> {'value': <collection name or 'NOT_COLLECTION'>, 'ts': ...}
-        Kept forever regardless of CACHE_SCHEMA_VERSION or cache-clear actions.
-        """
         path = self._permanent_path(brand_slug)
         if os.path.exists(path):
             try:
                 with open(path, 'r') as fh:
-                    return json.load(fh)
+                    data = json.load(fh)
+                    for k, item in data.items():
+                        if item.get('value') and item['value'] != 'NOT_COLLECTION':
+                            item['value'] = self._normalize_name(item['value'])
+                    return data
             except Exception:
                 return {}
         return {}
 
     def _save_permanent(self, brand_slug: str, tag_lower: str, value: str):
+        norm_val = value if value == 'NOT_COLLECTION' else self._normalize_name(value)
         try:
             data = self._load_permanent(brand_slug)
-            data[tag_lower] = {'value': value, 'ts': datetime.now().isoformat()}
+            data[tag_lower] = {'value': norm_val, 'ts': datetime.now().isoformat()}
             tmp_path = self._permanent_path(brand_slug) + ".tmp"
             with open(tmp_path, 'w') as f:
                 json.dump(data, f)
@@ -752,24 +794,16 @@ class CollectionDetector:
         use_ai: bool = True,
         custom_ignore_tags: Optional[Set[str]] = None,
     ) -> Tuple[Dict[str, str], Dict, List[Dict]]:
-        """
-        Main entry point. Returns (collection_map, stats, tag_debug_table).
-        """
         custom_ignore = {
             t.strip().lower() for t in (custom_ignore_tags or set()) if t.strip()
         }
         brand_slug = self._brand_slug(brand_name)
         permanent = self._load_permanent(brand_slug)
 
-        # Phase 1: local analysis + Type/specific-tag injection
-        # Footwear stores (logoofficial.com): tags are mostly color_*/promo/RD_*,
-        # while Shopify Product Type carries the real shop section.
         product_candidates: Dict[str, List[str]] = {}
         tag_to_products = defaultdict(set)
         tag_sample_text: Dict[str, str] = {}
-        # Track synthetic keys that are already known collections (skip AI)
-        known_synthetic: Dict[str, str] = {}  # key_lower -> collection name
-        # Priority: 0 = specific accessory tag, 1 = product type, 2 = normal tag
+        known_synthetic: Dict[str, str] = {}
         candidate_priority: Dict[str, int] = {}
 
         for handle, p in products.items():
@@ -777,7 +811,6 @@ class CollectionDetector:
             candidates = extract_candidate_tags(tags, custom_ignore)
             ordered: List[str] = []
 
-            # 1) Specific shop-section tags first (Socks, Perfume Mist, Kids Sandals…)
             for t in tags:
                 mapped = map_specific_tag_to_collection(t)
                 if mapped:
@@ -788,7 +821,6 @@ class CollectionDetector:
                         tag_sample_text[key] = mapped
                         candidate_priority[key] = 0
 
-            # 2) Shopify Product Type → shop collection
             ptype = (p.get('type') or '').strip()
             type_coll = map_product_type_to_collection(ptype)
             if type_coll:
@@ -799,12 +831,10 @@ class CollectionDetector:
                     tag_sample_text[key] = type_coll
                     candidate_priority[key] = 1
 
-            # 3) Remaining non-noise tags
             for c in candidates:
                 cl = c.lower()
                 if cl.startswith('__'):
                     continue
-                # Skip if already covered by specific map
                 if map_specific_tag_to_collection(c):
                     continue
                 if c not in ordered and cl not in [x.lower() for x in ordered]:
@@ -819,23 +849,19 @@ class CollectionDetector:
                 if cl not in tag_sample_text:
                     tag_sample_text[cl] = known_synthetic.get(cl, c)
 
-        # Phase 2: brand-scoped cache lookup
         tag_resolution: Dict[str, Optional[str]] = {}
         uncached: Dict[str, Dict[str, Any]] = {}
 
         for tag_lower, handles in tag_to_products.items():
-            # Synthetic type/spec keys resolve immediately — never AI/cache
             if tag_lower in known_synthetic:
                 tag_resolution[tag_lower] = known_synthetic[tag_lower]
                 continue
 
-            # 1) Permanent store — never expires, survives schema bumps and
-            #    "Reset Learning" clicks. Checked before the versioned cache.
             if tag_lower in permanent:
                 self.stats['cache_hits'] += 1
                 cached_val = permanent[tag_lower]['value']
                 tag_resolution[tag_lower] = (
-                    None if cached_val == 'NOT_COLLECTION' else cached_val
+                    None if cached_val == 'NOT_COLLECTION' else self._normalize_name(cached_val)
                 )
                 continue
 
@@ -844,10 +870,8 @@ class CollectionDetector:
                 self.stats['cache_hits'] += 1
                 cached_val = self.cache[cache_key]
                 tag_resolution[tag_lower] = (
-                    None if cached_val == 'NOT_COLLECTION' else cached_val
+                    None if cached_val == 'NOT_COLLECTION' else self._normalize_name(cached_val)
                 )
-                # Backfill the permanent store from the versioned cache so it
-                # doesn't need to wait for a fresh AI call to be promoted.
                 self._save_permanent(brand_slug, tag_lower, cached_val)
                 permanent[tag_lower] = {'value': cached_val}
             else:
@@ -858,7 +882,6 @@ class CollectionDetector:
                     'freq': len(handles),
                 }
 
-        # Phase 3: classify EVERY uncached tag
         if uncached:
             if use_ai and self.client:
                 positive, negative = self._ai_classify_all(
@@ -868,23 +891,22 @@ class CollectionDetector:
                 positive = self._fallback_classify(uncached)
                 negative = set(uncached.keys()) - set(positive.keys())
 
-            # Recover occasion / parent-bucket tags the model wrongly rejected
             for tag_lower in list(negative):
                 sample = uncached.get(tag_lower, {}).get('tag') or tag_sample_text.get(tag_lower, tag_lower)
                 if is_recoverable_occasion_tag(sample):
                     recovered = self._normalize_name(sample)
                     positive[tag_lower] = recovered
                     negative.discard(tag_lower)
-                # Known specific accessory tags AI might still see as raw text
                 elif map_specific_tag_to_collection(sample):
                     positive[tag_lower] = map_specific_tag_to_collection(sample)
                     negative.discard(tag_lower)
 
             for tag_lower, name in positive.items():
+                norm_name = self._normalize_name(name)
                 cache_key = f"{CACHE_SCHEMA_VERSION}::{brand_slug}::tag::{tag_lower}"
-                self._save_cache(cache_key, name)
-                self._save_permanent(brand_slug, tag_lower, name)
-                tag_resolution[tag_lower] = name
+                self._save_cache(cache_key, norm_name)
+                self._save_permanent(brand_slug, tag_lower, norm_name)
+                tag_resolution[tag_lower] = norm_name
 
             for tag_lower in negative:
                 cache_key = f"{CACHE_SCHEMA_VERSION}::{brand_slug}::tag::{tag_lower}"
@@ -892,32 +914,19 @@ class CollectionDetector:
                 self._save_permanent(brand_slug, tag_lower, 'NOT_COLLECTION')
                 tag_resolution[tag_lower] = None
 
-        # Frequency for specificity among equal-priority candidates
         collection_tag_freq: Dict[str, int] = {}
         for tag_lower, name in tag_resolution.items():
             if name:
                 collection_tag_freq[tag_lower] = len(tag_to_products.get(tag_lower, []))
 
-        # Phase 4: priority-aware assignment
-        #   0 = specific accessory/shop tag (Socks, Kids Sandals, Perfume Mist)
-        #   1 = Shopify Product Type (Formal Shoes → Loafers & Lace Up)
-        #   2 = other AI/heuristic collection tags
-        # Then: non-parent, lower frequency, more words.
-        sale_indicators = [
-            'flat', 'sale', 'clearance', 'discount', '% off',
-            'festive sale', 'end of season', 'reddot', 'b1g1', 'dot sale',
-        ]
         collection_map: Dict[str, str] = {}
-
         for handle, candidates in product_candidates.items():
             matches: List[Tuple[int, int, str, str, bool]] = []
-            # (priority, freq, tag_lower, collection_name, is_parent)
             seen_names = set()
             for c in candidates:
                 cl = c.lower()
                 name = tag_resolution.get(cl)
                 if not name:
-                    # Direct known synthetic
                     name = known_synthetic.get(cl)
                 if not name:
                     continue
@@ -926,7 +935,7 @@ class CollectionDetector:
                 seen_names.add(name.lower())
                 freq = collection_tag_freq.get(cl, len(tag_to_products.get(cl, [])) or 9999)
                 parent = is_parent_bucket(c) or is_parent_bucket(name)
-                # Mega "Accessories" parent loses to Socks/Belts/etc.
+
                 if name.lower() in ('accessories', 'fragrance') and not cl.startswith('__spec__'):
                     parent = True
                 pri = candidate_priority.get(cl, 2)
@@ -939,10 +948,10 @@ class CollectionDetector:
             if matches:
                 matches.sort(
                     key=lambda m: (
-                        m[0],                      # lower priority number first
-                        1 if m[4] else 0,           # parent buckets later
-                        m[1],                      # lower frequency first
-                        -len(m[3].split()),        # more words first
+                        m[0],
+                        1 if m[4] else 0,
+                        m[1],
+                        -len(m[3].split()),
                         -len(m[3]),
                         m[3].lower(),
                     )
@@ -950,19 +959,49 @@ class CollectionDetector:
                 collection_map[handle] = matches[0][3]
                 continue
 
-            # Fallback: product type alone even if not injected
+            # Product Type Fallback
             type_coll = map_product_type_to_collection(products[handle].get('type', ''))
             if type_coll:
                 collection_map[handle] = type_coll
                 continue
 
-            tags_raw = products[handle].get('tags_raw', '').lower()
-            if any(ind in tags_raw for ind in sale_indicators):
-                collection_map[handle] = "Sale / Clearance"
+            # Brand Handle/SKU Prefix Fallback (e.g. SP- -> Shades of Summer, DD- -> Daily Delights)
+            pref = handle.split('-')[0].upper()
+            if pref in BRAND_PREFIX_COLLECTION_MAP:
+                collection_map[handle] = BRAND_PREFIX_COLLECTION_MAP[pref]
+                continue
+
+            # Product Title / Raw Tags Fallback (Search for known lines in title/tags)
+            p_obj = products[handle]
+            title_lower = p_obj.get('title', '').lower()
+            tags_raw = p_obj.get('tags_raw', '').lower()
+
+            found_line = None
+            for kw_line in [
+                'Daily Delights', 'Gardenia', 'Raha', 'Maya', 'Shades of Summer',
+                'Everyday Pret', 'Casual Pret', 'Formal Pret', 'Chiffon Luxe',
+                'Printed Swiss Lawn', 'Jhoomro', 'Elanora', 'Amaya', 'Feya',
+                'Inam', 'Rania', 'Ballerina', 'Mukeshkari', 'Tiny Twinkles',
+                'Royal Palace', 'The Silk', 'Trend Setters'
+            ]:
+                if kw_line.lower() in title_lower or kw_line.lower() in tags_raw:
+                    found_line = kw_line
+                    break
+
+            if found_line:
+                collection_map[handle] = found_line
+                continue
+
+            # Category Parent Fallback
+            if 'unstitched' in tags_raw or 'lawn' in tags_raw:
+                collection_map[handle] = 'Unstitched'
+            elif 'pret' in tags_raw:
+                collection_map[handle] = 'Pret'
+            elif 'exclusive' in tags_raw:
+                collection_map[handle] = 'Exclusive'
             else:
                 collection_map[handle] = 'Other / Unmapped'
 
-        # Debug table
         debug_table = []
         for tag_lower, name in tag_resolution.items():
             sample = tag_sample_text.get(tag_lower, tag_lower)
@@ -983,10 +1022,7 @@ class CollectionDetector:
                 'is_parent': is_parent,
             })
         debug_table.sort(key=lambda x: x['frequency'], reverse=True)
-
         return collection_map, self.stats, debug_table
-
-    # ── AI classification ────────────────────────────────────────────────
 
     def _ai_classify_all(
         self,
@@ -999,7 +1035,6 @@ class CollectionDetector:
         sorted_items = sorted(uncached.items(), key=lambda kv: kv[1]['freq'], reverse=True)
         positive: Dict[str, str] = {}
         negative: Set[str] = set()
-
         num_batches = (len(sorted_items) + batch_size - 1) // batch_size
         for i in range(0, len(sorted_items), batch_size):
             batch = dict(sorted_items[i:i + batch_size])
@@ -1011,25 +1046,13 @@ class CollectionDetector:
             for tag_lower in batch:
                 if tag_lower not in pos and tag_lower not in neg:
                     negative.add(tag_lower)
-            # Small pause between batches — avoids tripping the proxy's
-            # per-deployment rate limiter when there are several batches.
             if num_batches > 1 and (i + batch_size) < len(sorted_items):
                 time.sleep(1.5)
-
         return positive, negative
 
     def _call_with_retry(self, base_kwargs: dict, max_retries: int = 8):
-        """
-        Calls the chat completion endpoint with retry-with-backoff, specifically
-        for transient 'no deployments available' / 429 rate-limit errors that
-        LiteLLM-style proxies (like Bluesminds) return under load. The proxy's
-        "try again in 5 seconds" message understates the real cooldown window
-        (observed ~50s+ in practice), so we back off longer and further than
-        that message suggests, with jitter so parallel jobs don't retry in lockstep.
-        """
         import random
         from openai import RateLimitError, APIConnectionError, APITimeoutError
-
         last_err = None
         for attempt in range(1, max_retries + 1):
             try:
@@ -1040,13 +1063,11 @@ class CollectionDetector:
                 except (RateLimitError, APIConnectionError, APITimeoutError):
                     raise
                 except Exception:
-                    # response_format not supported by this backend — retry without it
                     return self.client.chat.completions.create(**base_kwargs)
             except (RateLimitError, APIConnectionError, APITimeoutError) as e:
                 last_err = e
                 if attempt == max_retries:
                     break
-                # 8s, 15s, 25s, 35s, 45s, 55s, 60s, 60s (capped) + jitter
                 wait = min(8 + (attempt - 1) * 10, 60) + random.uniform(0, 3)
                 print(
                     f"⏳ AI call rate-limited/unavailable (attempt {attempt}/{max_retries}), "
@@ -1067,7 +1088,6 @@ class CollectionDetector:
         candidate_list = [
             {'tag': c['tag'], 'in_products': c['freq']} for c in sorted_candidates
         ]
-
         batch_tags_lower = set(batch.keys())
         sample_products = []
         for handle, candidates in product_candidates.items():
@@ -1080,7 +1100,6 @@ class CollectionDetector:
                 })
 
         prompt = f"""You are looking at product TAGS exported from a Shopify store called "{brand_name}".
-
 Your only job: for each candidate tag below, decide whether it is the name of a
 CLOTHING COLLECTION / PRODUCT LINE / MARKETING CAMPAIGN / CATEGORY BUCKET, or
 whether it is something else merchants commonly tag products with for
@@ -1089,86 +1108,35 @@ internal/operational reasons.
 A tag IS a collection when it identifies a product line, campaign, or shop
 category a customer (or inventory manager) would group products by. Examples:
 - Named product lines / campaigns / codenames (VERY COMMON): "Gardenia",
-  "Maya", "Shades Of Summer", "Damask", "Mini", "Mini26", "MiniV2", "Noirae",
-  "Noirae26", "NoiraeV2", "Barfi", "Premiere", "Muse", "Khushiyan", "Pret26",
-  "Sorelle2", "Solace", "Lemonade", "Capsule", "Grown2", "Zarah", "Mulaqaat'26"
-- Style / occasion / channel categories: "Casual Pret", "Formal Pret",
-  "Festive", "Wedding Formals", "Nureh Unstitched", "Peshwas & Lehngas"
+  "Raha", "Daily Delights", "Maya", "Shades Of Summer", "Damask", "Mini",
+  "Noirae", "Barfi", "Premiere", "Muse", "Khushiyan", "Pret26", "Sorelle2",
+  "Solace", "Lemonade", "Capsule", "Grown2", "Zarah", "Mulaqaat'26",
+  "K&G-TShirts&Polo", "K&B-TShirts&Polo", "Kids&Boys-TShirt&Polo", "B&K-T&PoloShirts",
+  "Tiny Twinkles", "Jhoomro", "Elanora", "Jugni", "Omara", "Aman", "Naveed",
+  "Amaya", "Feya", "Inam", "Rania", "Ballerina", "Royal Palace", "Mukeshkari",
+  "Sign Printed Lawn", "Chiffon Luxe", "Printed Swiss Lawn"
+- Style / occasion / channel categories: "Everyday Pret", "Casual Pret",
+  "Formal Pret", "Fancy Formal", "Festive", "Wedding Formals", "Nureh Unstitched",
+  "Nureh Exclusive", "Peshwas & Lehngas"
 - Seasonal edits: "Festive Edition", "Eid Edit", "Shades of Winter"
 
 CRITICAL — short codenames AND year-edits ARE collections:
 Tags like "mini26", "miniv2", "Pret26", "grown2", "barfi", "muse" are product
-LINE names. Also year-edited RTW lines are collections, NOT generic parents:
-"Basic Pret '26", "Cords Pret 2026", "The Haze '2026", "Mulaqaat'26",
-"Florette'26", "Sheer Khurma", "A Lawn", "Muted Muse '26", "The Brides Edit'26".
-Mark these as collections with clean Title Case names.
+LINE names. Also year-edited RTW lines are collections, NOT generic parents.
 
-CRITICAL — product titles are NOT collections:
-A single proper noun used on only 1 product (matching the product title like
-"Candlenight", "Tearose", "Sofia") is a PRODUCT NAME tag, not a collection.
-Answer NOT_COLLECTION. Prefer the campaign/line tag on that product instead
-(e.g. Dastangoi'25, Shehnai25, La Fuchsia 25).
-
-CRITICAL — internal batch codes are NOT collections:
-"BX 26", "*-sc" style codes (Soan-sc, Nyrella-sc), cart-button-hider,
-collection products — NOT_COLLECTION.
-
-CRITICAL — audience / marketing / color / promo tags are NOT collections:
-"women", "ladies", "girls", "kids", "three piece", "two piece", "Dresses",
-"Bestseller", "new", bare "Summer"/"Winter", brand name alone (LOGO, Ziva),
-color_BLACK / color_BROWN / any color_* tag, reddot, add5, B1G1, Lastpair,
-RD_SHOES, RD_ACCESSORIES — these are filters/promos, NOT inventory lines.
-
-CRITICAL — footwear & accessories shop sections ARE collections:
-"Slippers", "Sandals", "Premium Sneakers", "Active Collection" / Sports,
-"Perfume", "Perfume Mist", "Eau de Toilette", "Room Spray", "Socks",
-"Belts", "Note Wallets", "Card Holders", "Shoe Care", "Kids Sandals",
-"Kids Slippers", "Leather Accessories", "Loafers & Lace Up", "Casuals & Slip-Ons".
-
-CRITICAL — occasion words ARE collections in fashion retail:
-"Festive", "Eid", "Wedding Formals" are real shop sections. Bare season words
-alone ("Summer", "Winter") without a named line are NOT collections.
-
-IMPORTANT about multi-tag products (very common in Pakistani fashion brands):
-products often carry BOTH a parent/category tag ("Afrozeh", "Festive",
-"Nureh Unstitched", "Casual Pret") AND a named collection ("Damask",
-"Gardenia", "Shades Of Summer"). Mark BOTH as collections — do NOT reject the
-named line just because a parent tag also exists, and do NOT reject the parent
-just because a named line exists. (The report engine will later prefer the
-more specific named line per product.)
-
-A tag is NOT a collection when it is one of:
-- A product code, SKU fragment, or internal reference (letters+numbers)
-- A size, fabric, or garment type that slipped past local filtering
-- An operational/internal marker: sync flags (PPD-*, nada-hidden, No Sync,
-  PK ACTIVE PRODUCTS), hide/show, restock markers, QA/testing labels,
-  warehouse or staff shorthand (BH, NEWH, N-P, N-H, Ymq_Size, stitched_note,
-  unstitched_note, HideCODvariants, C-grade, Open-cart, products_from_sheet,
-  bridal_disclaimer, lining-note, custom_flow, self, Slate), batch/drop codes
-- A bare date, price, or discount/sale label ("Discount 5", "Flat 30%", "30%",
-  "27-12-2023_SALE-UPTO30%")
-- A generic admin word on its own ("Featured") that isn't a shop section
-- Color-only tags ("PINK") or pure fabric variants without a line name
-
-Be conservative on noise, but DO accept clear named product lines AND occasion
-/ shop category buckets including "Festive". If a tag looks like a proper-noun
-campaign name used consistently across products — answer with a clean Title
-Case collection name.
-
-CANDIDATE TAGS (exact text, and how many products use it):
-{json.dumps(candidate_list, indent=1, ensure_ascii=False)}
-
-SAMPLE PRODUCTS FOR CONTEXT (title + all their non-noise tags):
-{json.dumps(sample_products, indent=1, ensure_ascii=False)}
+CRITICAL — NEVER output "Sale / Clearance" as a collection name:
+Discount tags like "Flat 20%", "Discount 5", "Sale collection" are promotional filters,
+NOT collection lines. Answer NOT_COLLECTION for promotional/discount tags.
 
 Return ONLY a JSON object mapping each candidate tag (exact text as given) to
 either its properly capitalized collection name, or the literal string
 "NOT_COLLECTION". No markdown, no explanation, no extra keys.
 
-Normalization rules for the collection name you return:
-- Strip leading/trailing asterisks or underscores (*MAYA* → Maya, _Winter → ignore if season-only)
-- Title Case normal words; keep short all-caps brand tokens only if meaningful
-- Collapse near-duplicates to one clean name (maya / MAYA / *MAYA* → "Maya")
+CANDIDATE TAGS:
+{json.dumps(candidate_list, indent=1, ensure_ascii=False)}
+
+SAMPLE PRODUCTS FOR CONTEXT:
+{json.dumps(sample_products, indent=1, ensure_ascii=False)}
 """
 
         base_kwargs = dict(
@@ -1189,7 +1157,6 @@ Normalization rules for the collection name you return:
 
         try:
             response = self._call_with_retry(base_kwargs)
-
             result_text = (response.choices[0].message.content or '').strip()
             self.stats['ai_tokens'] += (
                 response.usage.total_tokens if response.usage else 0
@@ -1208,7 +1175,6 @@ Normalization rules for the collection name you return:
             for tag_text, verdict in result.items():
                 tag_lower = tag_text.lower().strip()
                 if tag_lower not in batch:
-                    # Model may have returned a cleaned key; try fuzzy match
                     continue
                 if verdict and str(verdict).strip().upper() != 'NOT_COLLECTION':
                     positive[tag_lower] = self._normalize_name(str(verdict).strip())
@@ -1231,18 +1197,8 @@ Normalization rules for the collection name you return:
             return fb, neg
 
     def _fallback_classify(self, uncached: Dict[str, Dict]) -> Dict[str, str]:
-        """Frequency heuristic — only used in Fast Pattern Mode (AI disabled)
-        or if an AI call outright fails. NOT used to override an AI verdict.
-
-        Tuned for Pakistani fashion tags where collection codenames are often
-        short proper nouns or word+year/version (mini26, miniv2, Pret26, Barfi,
-        Basic Pret '26). Never promotes color_/promo/RD_/product-title noise.
-        """
         results = {}
-        # Collection-like: letters + optional year/version digits, no separator
-        # e.g. mini26, miniv2, Pret26, grown2, noirae26, Barfi, Muse
         codename = re.compile(r'^[A-Za-z][A-Za-z]{2,}[vV]?\d{0,4}$')
-        # Named line with year/edit: "Basic Pret '26", "The Haze '2026", "Mulaqaat'26"
         named_edit = re.compile(
             r".+['’]?\s*\d{2,4}$|.+\s+(pret|lawn|edit|formals?|bridals?)\b",
             re.I,
@@ -1250,30 +1206,35 @@ Normalization rules for the collection name you return:
 
         for tag_lower, info in uncached.items():
             freq = info['freq']
-            tag = _strip_tag_wrappers(info['tag'])
+            tag = strip_tag_wrappers(info['tag'])
             if is_noise_tag(tag)[0]:
                 continue
-            # Specific accessory maps
+
             mapped = map_specific_tag_to_collection(tag)
             if mapped:
                 results[tag_lower] = mapped
                 continue
-            # Always keep occasion / parent buckets even at low frequency
+
+            # Structured brand line tags with hyphens & ampersands (e.g. B&K-T&PoloShirts, K&G-Frocks)
+            if re.match(r'^[A-Za-z0-9&]+[_\-][A-Za-z0-9&\-_/]+$', tag) and freq >= 1:
+                results[tag_lower] = self._normalize_name(tag)
+                continue
+
             if is_recoverable_occasion_tag(tag) and freq >= 1:
                 results[tag_lower] = self._normalize_name(tag)
                 continue
-            # Named RTW / seasonal edits with year — real collections even at low freq
-            # e.g. Basic Pret '26 (10 products), Cords Pret 2026, The Haze '2026
+
             if named_edit.match(tag) and freq >= 2 and len(tag) >= 6:
                 results[tag_lower] = self._normalize_name(tag)
                 continue
-            # Codenames need multiple products — single-product proper nouns are
-            # almost always product titles (Candlenight, Tearose), not collections.
+
             if codename.match(tag) and freq >= 3:
                 results[tag_lower] = self._normalize_name(tag)
                 continue
+
             if freq < 2:
                 continue
+
             words = re.split(r"[\s_'’]+", tag)
             words = [w for w in words if w]
             is_multi_word = len(words) >= 2
@@ -1290,30 +1251,25 @@ Normalization rules for the collection name you return:
                 results[tag_lower] = self._normalize_name(tag)
             elif is_all_lower and len(words) == 1 and 3 <= len(tag) <= 20 and freq >= 4:
                 results[tag_lower] = self._normalize_name(tag)
+
         return results
 
     @staticmethod
     def _normalize_name(name: str) -> str:
-        """Title-case / brand-style normalize a collection name.
-
-        Fashion brands often use glued codenames — keep them readable but
-        preserve the common forms from the correct reports:
-          mini26 → Mini26, miniv2 → MiniV2, Pret26 → Pret26
-          Mulaqaat'26 → Mulaqaat '26
+        """Title-case / brand-style normalize a collection name cleanly while preserving
+        mixed case, hyphenated/ampersand tags, and brand codenames like K&G-TShirts&Polo.
         """
         if not name:
             return 'Other / Unmapped'
-        name = _strip_tag_wrappers(name).strip()
+        name = strip_tag_wrappers(name).strip()
 
         # Preserve common collection codename shapes: Word + digits / Word + v + digits
-        # mini26, Mini26, miniv2, Pret26, grown2, noirae26
         m = re.fullmatch(r'([A-Za-z]+?)([vV])?(\d{1,4})', name)
         if m and len(m.group(1)) >= 3:
             base = m.group(1)
-            # Title-case base but keep internal capitals if already CamelCase
-            if base.isupper() and len(base) <= 4:
-                base_fmt = base
-            elif base.islower():
+            if base.upper() in ACRONYMS or (base.isupper() and len(base) <= 2):
+                base_fmt = base.upper()
+            elif base.islower() or base.isupper():
                 base_fmt = base.capitalize()
             else:
                 base_fmt = base[0].upper() + base[1:]
@@ -1325,8 +1281,10 @@ Normalization rules for the collection name you return:
 
         # Apostrophe years: Mulaqaat'26 → Mulaqaat '26
         name = re.sub(r"(['’])\s*(\d{2,4})\b", r" '\2", name)
-        # CamelCase split only when clearly glued words (NewArrivals)
-        name = re.sub(r'([a-z])([A-Z])', r'\1 \2', name)
+
+        # Split CamelCase only when NOT inside a hyphenated/glued brand tag
+        if ' ' in name or not any(c in name for c in ('-', '&', '_')):
+            name = re.sub(r'([a-z])([A-Z])', r'\1 \2', name)
         name = re.sub(r"\s+", " ", name).strip()
 
         words = name.split()
@@ -1335,58 +1293,57 @@ Normalization rules for the collection name you return:
             if re.fullmatch(r"'?\d{2,4}", w):
                 result.append(w)
                 continue
-            if i == 0 or w.lower() not in ('of', 'the', 'and', 'in', 'with', 'for', 'a', 'an'):
-                result.append(w.capitalize() if not w.isupper() or len(w) > 3 else w)
-            else:
-                result.append(w.lower())
-        return ' '.join(result) if result else name
 
+            if w.upper() in ACRONYMS:
+                result.append(w.upper())
+                continue
+
+            upper_cnt = sum(1 for c in w if c.isupper())
+            if upper_cnt >= 2 and not any(c in w for c in ('-', '_')) and not w.isupper():
+                result.append(w)
+                continue
+
+            if any(c in w for c in ('&', '-', '/', '_')):
+                sub_tokens = re.split(r'([&\-/_]+)', w)
+                formatted_subs = []
+                for sub in sub_tokens:
+                    if re.match(r'^[&\-/_]+$', sub):
+                        formatted_subs.append(sub)
+                    elif sub.upper() in ACRONYMS or (len(sub) <= 2 and sub.isalpha()):
+                        formatted_subs.append(sub.upper())
+                    elif sub.islower() or sub.isupper():
+                        formatted_subs.append(sub.capitalize())
+                    else:
+                        formatted_subs.append(sub)
+                result.append(''.join(formatted_subs))
+                continue
+
+            if i > 0 and w.lower() in ('of', 'the', 'and', 'in', 'with', 'for', 'a', 'an'):
+                result.append(w.lower())
+            else:
+                if w.islower() or w.isupper():
+                    result.append(w.capitalize())
+                else:
+                    result.append(w)
+
+        return ' '.join(result) if result else name
 
 # ─── CSV LOADER ──────────────────────────────────────────────────────────────
 
-def _parse_int(val) -> int:
+def parse_int(val) -> int:
     try:
         return int(float(val or 0))
     except (TypeError, ValueError):
         return 0
 
-
-def _parse_float(val) -> float:
+def parse_float(val) -> float:
     try:
         return float(val or 0)
     except (TypeError, ValueError):
         return 0.0
 
-
 def load_products(csv_path: str, brand_override: Optional[str] = None):
-    """
-    Shopify export loader — product = unique Handle (not CSV row).
-
-    Rules (must match inventory reporting definition):
-      1. Product key = Handle. Size / color variants are multiple CSV rows of
-         the same Handle and must be collapsed into one product.
-      2. Product fields (Title, Tags, Published, Status, Type, Vendor) come
-         from the first non-empty value seen for that Handle. Shopify only
-         fills these on the first variant row — later rows are blank.
-      3. Active + published filter is applied at PRODUCT level after collapsing:
-         Status == active AND Published == true.
-      4. Product units = SUM(Variant Inventory Qty) across all rows of the
-         Handle.
-      5. Retail value = SUM(Variant Inventory Qty × Variant Price) at each
-         variant row (correct when sizes have different prices).
-
-    Collection detail / positive-inventory set:
-      products_with_stock = active+published handles with net units > 0
-      (zero-inventory products are counted in KPIs but excluded from
-       collection tables, matching the reference inventory report).
-
-    Returns (products_with_stock, brand_name, inventory_stats).
-    """
-    # Stage 1: collapse every CSV row into per-Handle accumulators.
-    # Do NOT filter Status/Published on individual rows — they are blank on
-    # size-variant rows and would drop inventory if checked row-by-row.
     by_handle: Dict[str, Dict[str, Any]] = {}
-    vendor_counts: Counter = Counter()
 
     with open(csv_path, 'r', encoding='utf-8', errors='replace') as f:
         for r in csv.DictReader(f):
@@ -1406,9 +1363,9 @@ def load_products(csv_path: str, brand_override: Optional[str] = None):
                     'total_value': 0.0,
                     'variant_rows': 0,
                 }
+
             p = by_handle[handle]
 
-            # First non-empty wins for product-level fields
             title = (r.get('Title') or '').strip()
             if title and not p['title']:
                 p['title'] = title
@@ -1432,19 +1389,13 @@ def load_products(csv_path: str, brand_override: Optional[str] = None):
             vendor = (r.get('Vendor') or '').strip()
             if vendor and not p['vendor']:
                 p['vendor'] = vendor
-            if vendor and vendor.lower() not in (
-                'express shipping ⚡', 'express shipping'
-            ):
-                vendor_counts[vendor] += 1
 
-            # Always accumulate inventory from EVERY variant row
-            qty = _parse_int(r.get('Variant Inventory Qty'))
-            price = _parse_float(r.get('Variant Price'))
+            qty = parse_int(r.get('Variant Inventory Qty'))
+            price = parse_float(r.get('Variant Price'))
             p['total_qty'] += qty
-            p['total_value'] += qty * price  # row-level qty × price
+            p['total_value'] += qty * price
             p['variant_rows'] += 1
 
-    # Stage 2: product-level filters + KPI counts
     products_with_stock: Dict[str, Dict[str, Any]] = {}
     active_published = 0
     with_stock_count = 0
@@ -1477,43 +1428,33 @@ def load_products(csv_path: str, brand_override: Optional[str] = None):
         else:
             out_of_stock_count += 1
 
-    if brand_override:
-        detected_vendor = brand_override
-    elif vendor_counts:
-        detected_vendor = vendor_counts.most_common(1)[0][0]
-    else:
-        detected_vendor = "Shopify Store"
+    detected_vendor = detect_brand(by_handle, brand_override)
 
     inventory_stats = {
-        'active_published': active_published,       # Total products (active + published)
-        'products_with_stock': with_stock_count,    # Positive inventory
-        'out_of_stock': out_of_stock_count,         # Zero inventory
-        'available_units': total_units,             # All locations combined
-        'inventory_value': total_value,             # At retail price
+        'active_published': active_published,
+        'products_with_stock': with_stock_count,
+        'out_of_stock': out_of_stock_count,
+        'available_units': total_units,
+        'inventory_value': total_value,
     }
 
     return products_with_stock, detected_vendor, inventory_stats
 
-
 # ─── AGGREGATION ─────────────────────────────────────────────────────────────
 
 def aggregate_by_collection(products, collection_map):
-    """
-    Aggregate already-filtered products (unique Handle, units > 0) by collection.
-    products_count = number of unique handles in the collection.
-    total_units / total_value already use the correct per-Handle sums.
-    """
     colls = defaultdict(lambda: {
         'products': set(),
-        'products_with_stock': set(),  # all products here have units > 0
-        'products_out_of_stock': set(),  # always empty under units>0 filter
+        'products_with_stock': set(),
+        'products_out_of_stock': set(),
         'total_units': 0,
         'total_value': 0.0,
         'product_details': [],
     })
+
     for h, p in products.items():
         c = collection_map.get(h, 'Other / Unmapped')
-        colls[c]['products'].add(h)  # unique Handle
+        colls[c]['products'].add(h)
         colls[c]['products_with_stock'].add(h)
         colls[c]['total_units'] += p['total_qty']
         colls[c]['total_value'] += p['total_value']
@@ -1524,28 +1465,17 @@ def aggregate_by_collection(products, collection_map):
             'value': p['total_value'],
             'out_of_stock': False,
         })
+
     for c in colls:
         colls[c]['product_details'].sort(
             key=lambda x: (-x['value'], x['title'].lower())
         )
-    return sorted(colls.items(), key=lambda x: x[1]['total_value'], reverse=True)
 
+    return sorted(colls.items(), key=lambda x: x[1]['total_value'], reverse=True)
 
 # ─── FORMATTERS ──────────────────────────────────────────────────────────────
 
 def fmt_pkr(v):
-    """Full retail value — matches reference report style (Rs 13.96 Cr)."""
-    if v >= 1e7:  # 1 crore = 10,000,000
-        return f"Rs {v/1e7:.2f} Cr"
-    if v >= 1e5:  # 1 lakh
-        return f"Rs {v/1e5:.1f}L"
-    if v >= 1e3:
-        return f"Rs {v:,.0f}"
-    return f"Rs {v:,.0f}"
-
-
-def fmt_pkr_short(v):
-    """Compact value for tables."""
     if v >= 1e7:
         return f"Rs {v/1e7:.2f} Cr"
     if v >= 1e5:
@@ -1554,10 +1484,27 @@ def fmt_pkr_short(v):
         return f"Rs {v:,.0f}"
     return f"Rs {v:,.0f}"
 
+def fmt_pkr_short(v):
+    if v >= 1e7:
+        return f"Rs {v/1e7:.2f} Cr"
+    if v >= 1e5:
+        return f"Rs {v/1e5:.1f}L"
+    if v >= 1e3:
+        return f"Rs {v:,.0f}"
+    return f"Rs {v:,.0f}"
 
 def fmt_units(n):
     return f"{n:,}"
 
+def _pdf_text(text) -> str:
+    """Escape dynamic strings before interpolating into ReportLab Paragraphs.
+    First unescapes existing HTML/XML entities to prevent double-escaping (&amp;amp;),
+    then converts special characters (&, <, >) into XML entities for ReportLab.
+    """
+    if text is None:
+        return ''
+    raw = html.unescape(str(text))
+    return xml_escape(raw)
 
 # ─── PDF GENERATION ──────────────────────────────────────────────────────────
 
@@ -1574,20 +1521,8 @@ class HRFlowable(Flowable):
         self.canv.setLineWidth(self.thickness)
         self.canv.line(0, 2, self.width, 2)
 
-
 def build_pdf(products, collection_map, brand_name, output_path, inventory_stats=None):
-    """
-    PDF inventory report matching the reference layout:
-
-      KPI strip:
-        Active + published | Products with stock | Out of stock |
-        Available units | Inventory value
-
-      Collection tables only include products with positive inventory
-      (Active + Published only · Positive inventory only · All locations combined).
-    """
     collections = aggregate_by_collection(products, collection_map)
-
     stats = inventory_stats or {}
     active_published = int(stats.get('active_published', len(products)))
     with_stock = int(stats.get('products_with_stock', len(products)))
@@ -1600,6 +1535,7 @@ def build_pdf(products, collection_map, brand_name, output_path, inventory_stats
         rightMargin=15*mm, leftMargin=15*mm,
         topMargin=14*mm, bottomMargin=14*mm,
     )
+
     styles = getSampleStyleSheet()
     for name, kwargs in [
         ('Title2', dict(parent=styles['Title'], fontSize=18, leading=22, spaceAfter=1*mm,
@@ -1643,7 +1579,7 @@ def build_pdf(products, collection_map, brand_name, output_path, inventory_stats
 
     # ── Header ──────────────────────────────────────────────────────────
     story.append(Paragraph("INVENTORY REPORT", styles['Title2']))
-    story.append(Paragraph(f"{brand_name} — Active product inventory", styles['BrandLine']))
+    story.append(Paragraph(f"{_pdf_text(brand_name)} — Active product inventory", styles['BrandLine']))
     story.append(Paragraph(
         "Collection-wise stock and retail value for all active and published products "
         "with positive inventory",
@@ -1656,9 +1592,8 @@ def build_pdf(products, collection_map, brand_name, output_path, inventory_stats
         styles['ScopeNote'],
     ))
 
-    # ── KPI strip (matches reference report) ────────────────────────────
-    # Row of 5 cards: Active+published | With stock | Out of stock | Units | Value
-    def _kpi_cell(label, hint, value, value_style):
+    # ── KPI strip ───────────────────────────────────────────────────────
+    def kpi_cell(label, hint, value, value_style):
         return [
             Paragraph(label, styles['MetricLabel']),
             Paragraph(str(value), value_style),
@@ -1666,18 +1601,18 @@ def build_pdf(products, collection_map, brand_name, output_path, inventory_stats
         ]
 
     kpi_data = [[
-        _kpi_cell("Active + published", "Total products",
-                  f"{active_published:,}", styles['MetricValue']),
-        _kpi_cell("Products with stock", "Positive inventory",
-                  f"{with_stock:,}", styles['MetricValueBlue']),
-        _kpi_cell("Out of stock", "Zero inventory",
-                  f"{out_of_stock:,}", styles['MetricValueRed']),
-        _kpi_cell("Available units", "All locations",
-                  fmt_units(total_units), styles['MetricValue']),
-        _kpi_cell("Inventory value", "At retail price",
-                  fmt_pkr(total_value), styles['MetricValueGreen']),
+        kpi_cell("Active + published", "Total products",
+                 f"{active_published:,}", styles['MetricValue']),
+        kpi_cell("Products with stock", "Positive inventory",
+                 f"{with_stock:,}", styles['MetricValueBlue']),
+        kpi_cell("Out of stock", "Zero inventory",
+                 f"{out_of_stock:,}", styles['MetricValueRed']),
+        kpi_cell("Available units", "All locations",
+                 fmt_units(total_units), styles['MetricValue']),
+        kpi_cell("Inventory value", "At retail price",
+                 fmt_pkr(total_value), styles['MetricValueGreen']),
     ]]
-    # Flatten: each cell is a nested mini-table so label/value/hint stack
+
     flat_row = []
     for cell in kpi_data[0]:
         inner = Table([[c] for c in cell], colWidths=[pw/5 - 4])
@@ -1708,20 +1643,22 @@ def build_pdf(products, collection_map, brand_name, output_path, inventory_stats
     story.append(Paragraph("COLLECTION WISE OVERVIEW", styles['SectionHeader']))
     sd = [[Paragraph(h, styles['TableHeader']) for h in
            ["Collection", "Products", "Available Units", "Retail Value"]]]
+
     sum_products = sum_units = 0
     sum_value = 0.0
+
     for cn, cd in collections:
         n_prod = len(cd['products'])
         sum_products += n_prod
         sum_units += cd['total_units']
         sum_value += cd['total_value']
         sd.append([
-            Paragraph(cn, styles['TableCellBold']),
+            Paragraph(_pdf_text(cn), styles['TableCellBold']),
             Paragraph(str(n_prod), styles['TableCell']),
             Paragraph(fmt_units(cd['total_units']), styles['TableCell']),
             Paragraph(fmt_pkr_short(cd['total_value']), styles['TableCell']),
         ])
-    # Total row
+
     sd.append([
         Paragraph("Total", styles['TotalRow']),
         Paragraph(str(sum_products), styles['TotalRow']),
@@ -1752,7 +1689,7 @@ def build_pdf(products, collection_map, brand_name, output_path, inventory_stats
     story.append(Paragraph(
         "Method: Product = unique Handle. Units = Σ Variant Inventory Qty (all locations). "
         "Value = Σ (Qty × Price) per variant row at retail. "
-        "Filter: Status=active, Published=true. Collection tables: units &gt; 0 only.",
+        "Filter: Status=active, Published=true. Collection tables: units > 0 only.",
         styles['Footnote'],
     ))
     story.append(PageBreak())
@@ -1768,14 +1705,10 @@ def build_pdf(products, collection_map, brand_name, output_path, inventory_stats
     story.append(Spacer(1, 2*mm))
 
     for cn, cd in collections:
-        if cn == 'Other / Unmapped':
-            # Still show "Other" if it has stock (reference report does)
-            pass
         story.append(Paragraph(
-            f"{cn} &nbsp;&nbsp; {fmt_pkr_short(cd['total_value'])} · {fmt_units(cd['total_units'])} units",
+            f"{_pdf_text(cn)} &nbsp;&nbsp; {fmt_pkr_short(cd['total_value'])} · {fmt_units(cd['total_units'])} units",
             styles['CollectionHeader'],
         ))
-
         if not cd['product_details']:
             story.append(Paragraph("No products in this collection.", styles['TableCell']))
             story.append(Spacer(1, 2*mm))
@@ -1785,7 +1718,7 @@ def build_pdf(products, collection_map, brand_name, output_path, inventory_stats
                ["Product", "Units", "Retail Value"]]]
         for pi in cd['product_details']:
             dd.append([
-                Paragraph(pi['title'], styles['TableCellBold']),
+                Paragraph(_pdf_text(pi['title']), styles['TableCellBold']),
                 Paragraph(fmt_units(pi['units']), styles['TableCell']),
                 Paragraph(fmt_pkr_short(pi['value']), styles['TableCell']),
             ])
@@ -1810,14 +1743,13 @@ def build_pdf(products, collection_map, brand_name, output_path, inventory_stats
 
     story.append(Spacer(1, 6*mm))
     story.append(Paragraph(
-        f"{brand_name} Inventory Report &nbsp;·&nbsp; Active + Published · "
+        f"{_pdf_text(brand_name)} Inventory Report &nbsp;·&nbsp; Active + Published · "
         f"Positive Inventory · All Locations",
         styles['Footnote'],
     ))
 
     doc.build(story)
     return output_path
-
 
 # ─── CLEANUP ─────────────────────────────────────────────────────────────────
 
@@ -1829,6 +1761,7 @@ def cleanup_old_jobs(max_age=TEMP_FILE_TTL_MINUTES):
         if jd and os.path.exists(jd):
             shutil.rmtree(jd, ignore_errors=True)
         JOBS.pop(jid, None)
+
     if os.path.exists(TEMP_JOBS_DIR):
         for e in os.listdir(TEMP_JOBS_DIR):
             ep = os.path.join(TEMP_JOBS_DIR, e)
@@ -1839,7 +1772,6 @@ def cleanup_old_jobs(max_age=TEMP_FILE_TTL_MINUTES):
                 except Exception:
                     pass
 
-
 def get_server_storage_stats():
     cf = cs = 0
     if os.path.exists(CACHE_DIR):
@@ -1847,6 +1779,7 @@ def get_server_storage_stats():
             if f.endswith('.json'):
                 cf += 1
                 cs += os.path.getsize(os.path.join(CACHE_DIR, f))
+
     tj = ts = 0
     if os.path.exists(TEMP_JOBS_DIR):
         for r, d, fs in os.walk(TEMP_JOBS_DIR):
@@ -1856,6 +1789,7 @@ def get_server_storage_stats():
                 except Exception:
                     pass
         tj = len(os.listdir(TEMP_JOBS_DIR))
+
     return {
         "cache_files": cf,
         "cache_size_kb": round(cs/1024, 2),
@@ -1864,10 +1798,10 @@ def get_server_storage_stats():
         "active_memory_jobs": len(JOBS),
     }
 
-
 # ─── FASTAPI APP ─────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Shopify Inventory Report Generator Pro v4.4", version="4.4.0")
+app = FastAPI(title="Shopify Inventory Report Generator Pro v4.6", version="4.6.0")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1876,17 +1810,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
     return HTMLResponse(content=get_html())
-
 
 def get_html():
     return r"""<!DOCTYPE html>
 <html lang="en" class="bg-slate-50 text-slate-800">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Shopify Inventory Pro v4.2 — Specificity-Aware AI Collections</title>
+<title>Shopify Inventory Pro v4.6 — Frontend Aligned AI Collections</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://unpkg.com/lucide@latest"></script></head>
 <body class="min-h-screen flex flex-col font-sans">
@@ -1894,13 +1826,14 @@ def get_html():
 <div class="max-w-6xl mx-auto px-4 sm:px-6 py-4 flex items-center justify-between">
 <div class="flex items-center space-x-3">
 <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-blue-600 to-indigo-500 flex items-center justify-center text-white shadow-md"><i data-lucide="file-bar-chart-2" class="w-6 h-6"></i></div>
-<div><h1 class="text-lg font-bold text-slate-900">Shopify Inventory Pro <span class="text-xs font-normal text-emerald-600 bg-emerald-50 px-1.5 py-0.5 rounded">v4.2</span></h1>
-<p class="text-xs text-slate-500">Specificity-Aware AI • Named Lines Beat Parent Buckets • Any Brand</p></div></div>
+<div><h1 class="text-lg font-bold text-slate-900">Shopify Inventory Pro <span class="text-xs font-normal text-emerald-600 bg-emerald-50 px-1.5 py-0.5 rounded">v4.6</span></h1>
+<p class="text-xs text-slate-500">Website Frontend Collection Alignment • Zero Sale/Clearance Dummy Buckets</p></div></div>
 <div class="flex items-center space-x-3">
 <button onclick="refreshStats()" class="inline-flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 text-xs font-medium text-slate-600"><i data-lucide="database" class="w-3.5 h-3.5"></i><span id="cache-status">Cache: ...</span></button>
 <button onclick="resetLearning()" class="inline-flex items-center space-x-1 px-3 py-1.5 rounded-lg bg-amber-50 text-amber-700 hover:bg-amber-100 text-xs font-medium border border-amber-200"><i data-lucide="refresh-ccw" class="w-3.5 h-3.5"></i><span>Reset Learning</span></button>
 <button onclick="cleanServer()" class="inline-flex items-center space-x-1 px-3 py-1.5 rounded-lg bg-rose-50 text-rose-600 hover:bg-rose-100 text-xs font-medium border border-rose-200"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i><span>Free Space</span></button>
 </div></div></header>
+
 <main class="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 py-8 grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
 <div class="lg:col-span-5 space-y-6">
 <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-6">
@@ -1909,11 +1842,12 @@ def get_html():
 <input type="file" id="csv-file-input" accept=".csv" class="hidden" onchange="handleFile(this.files)">
 <div id="upload-prompt" class="space-y-2"><div class="w-12 h-12 rounded-full bg-blue-50 text-blue-600 flex items-center justify-center mx-auto"><i data-lucide="file-spreadsheet" class="w-6 h-6"></i></div>
 <p class="text-sm font-medium text-slate-700">Drop CSV here or click to browse</p>
-<p class="text-xs text-slate-400">Works with any Shopify store export</p></div>
+<p class="text-xs text-slate-400">Works with Nureh and any Shopify store export</p></div>
 <div id="file-info" class="hidden w-full"><div class="p-3 bg-blue-50 border border-blue-200 rounded-lg flex items-center justify-between">
 <div class="flex items-center space-x-3 overflow-hidden"><i data-lucide="check-circle-2" class="w-5 h-5 text-blue-600"></i>
 <div class="overflow-hidden"><p id="file-name" class="text-sm font-medium truncate"></p><p id="file-size" class="text-xs text-slate-500"></p></div></div>
 <button onclick="clearFile(event)" class="text-slate-400 hover:text-slate-600 p-1"><i data-lucide="x" class="w-4 h-4"></i></button></div></div></div></div>
+
 <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 space-y-5">
 <h2 class="text-base font-semibold flex items-center space-x-2"><i data-lucide="sliders" class="w-5 h-5 text-blue-600"></i><span>2. Settings</span></h2>
 <div>
@@ -1922,19 +1856,22 @@ def get_html():
 <label class="flex items-start p-3 rounded-xl border border-blue-500 bg-blue-50/40 cursor-pointer">
 <input type="radio" name="mode" value="ai" checked class="mt-0.5">
 <div class="ml-3 text-xs"><span class="font-bold text-blue-700">🤖 AI-Powered (Recommended)</span>
-<span class="bg-emerald-100 text-emerald-800 text-[10px] px-1.5 py-0.2 rounded ml-1">v4.2</span>
-<p class="text-slate-600 mt-0.5">Named collections (Gardenia, Maya…) beat parent buckets (Nureh Unstitched). Cached per-brand.</p></div></label>
+<span class="bg-emerald-100 text-emerald-800 text-[10px] px-1.5 py-0.2 rounded ml-1">v4.6</span>
+<p class="text-slate-600 mt-0.5">Website storefront matching + smart brand SKU/prefix resolution.</p></div></label>
 <label class="flex items-start p-3 rounded-xl border border-slate-200 cursor-pointer hover:bg-slate-50">
 <input type="radio" name="mode" value="fast" class="mt-0.5">
 <div class="ml-3 text-xs"><span class="font-bold text-emerald-700">⚡ Fast Pattern Mode</span>
 <span class="bg-slate-100 text-slate-700 text-[10px] px-1.5 py-0.2 rounded ml-1">$0.00</span>
-<p class="text-slate-600 mt-0.5">Zero API cost. Frequency heuristics + same specificity assignment.</p></div></label>
+<p class="text-slate-600 mt-0.5">Zero API cost. Pattern heuristics + brand prefix mapping.</p></div></label>
 </div></div>
+
 <div><label class="block text-xs font-semibold uppercase tracking-wider text-slate-500 mb-1.5">Brand Name (optional)</label>
-<input type="text" id="brand-name" placeholder="Auto-detected from Vendor column" class="w-full px-3.5 py-2 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none"></div>
+<input type="text" id="brand-name" placeholder="Auto-detected from active products & vendor" class="w-full px-3.5 py-2 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none"></div>
+
 <div><label class="block text-xs font-semibold uppercase tracking-wider text-slate-500 mb-1.5">Tags To Always Ignore (optional)</label>
 <textarea id="ignore-tags" rows="2" placeholder="Comma-separated, e.g. Staff Pick, VIP Only" class="w-full px-3.5 py-2 border border-slate-300 rounded-lg text-xs focus:ring-2 focus:ring-blue-500 outline-none"></textarea>
-<p class="text-[11px] text-slate-400 mt-1">Per-brand only. Operational noise like PPD-ELGBL / nada-hidden is already filtered.</p></div>
+<p class="text-[11px] text-slate-400 mt-1">Per-brand only. Operational noise is already filtered.</p></div>
+
 <details class="group border border-slate-200 rounded-xl">
 <summary class="px-4 py-2.5 text-xs font-medium text-slate-600 cursor-pointer flex items-center justify-between"><span>Custom API Settings</span><i data-lucide="chevron-down" class="w-4 h-4 text-slate-400 group-open:rotate-180 transition"></i></summary>
 <div class="px-4 pb-4 pt-2 border-t border-slate-100 space-y-3 text-xs">
@@ -1942,37 +1879,41 @@ def get_html():
 <div><label class="block text-slate-500 mb-1">API Base URL</label><input type="text" id="api-base" placeholder="https://api.bluesminds.com/v1" class="w-full px-3 py-1.5 border border-slate-300 rounded"></div>
 <div><label class="block text-slate-500 mb-1">Model</label><input type="text" id="api-model" placeholder="gpt-5-mini" class="w-full px-3 py-1.5 border border-slate-300 rounded"></div>
 </div></details>
+
 <button id="generate-btn" onclick="startGen()" disabled class="w-full py-3 rounded-xl font-semibold text-sm text-white bg-slate-300 cursor-not-allowed flex items-center justify-center space-x-2">
 <i data-lucide="zap" class="w-4 h-4"></i><span>Generate Report</span></button></div></div>
+
 <div class="lg:col-span-7 space-y-6">
 <div id="welcome" class="bg-white rounded-2xl border border-slate-200 shadow-sm p-8 text-center min-h-[450px] flex flex-col items-center justify-center">
 <div class="w-16 h-16 rounded-2xl bg-slate-100 text-slate-400 flex items-center justify-center mb-4"><i data-lucide="file-text" class="w-8 h-8"></i></div>
 <h3 class="text-base font-bold">Upload a CSV to get started</h3>
-<p class="text-sm text-slate-500 mt-1 max-w-sm">v4.2 prefers real named collections over parent category tags — fixes Nureh-style multi-tag catalogs.</p>
+<p class="text-sm text-slate-500 mt-1 max-w-sm">v4.6 aligns report collections with brand frontend navigation (Daily Delights, Raha, Shades Of Summer, Everyday Pret, Gardenia, Maya...) with zero Sale/Clearance dummy buckets.</p>
 <div class="mt-6 grid grid-cols-2 gap-3 text-left max-w-md w-full">
 <div class="p-3 rounded-xl bg-blue-50 border border-blue-200/80">
-<p class="text-blue-700 font-semibold text-xs mb-1">🎯 Specificity</p>
-<p class="text-slate-500 text-[11px]">Gardenia / Maya / Shades Of Summer win over Nureh Unstitched.</p></div>
+<p class="text-blue-700 font-semibold text-xs mb-1">🛍️ Storefront Alignment</p>
+<p class="text-slate-500 text-[11px]">Matches collections shown on shop frontend (Nureh & brands).</p></div>
 <div class="p-3 rounded-xl bg-emerald-50 border border-emerald-200/80">
-<p class="text-emerald-700 font-semibold text-xs mb-1">🧹 Noise Filter</p>
-<p class="text-slate-500 text-[11px]">PPD-ELGBL, nada-hidden, dates, prices auto-filtered.</p></div>
+<p class="text-emerald-700 font-semibold text-xs mb-1">🚫 No Dummy Sale Buckets</p>
+<p class="text-slate-500 text-[11px]">Discounted items stay in their real product lines.</p></div>
 <div class="p-3 rounded-xl bg-purple-50 border border-purple-200/80">
-<p class="text-purple-700 font-semibold text-xs mb-1">🧠 Learns</p>
-<p class="text-slate-500 text-[11px]">Per-brand cache. Reset Learning after upgrades.</p></div>
+<p class="text-purple-700 font-semibold text-xs mb-1">🧠 Brand Prefix Engine</p>
+<p class="text-slate-500 text-[11px]">SP-, DD-, NR-, AM-, MK-, TW- prefix fallback mapping.</p></div>
 <div class="p-3 rounded-xl bg-amber-50 border border-amber-200/80">
 <p class="text-amber-700 font-semibold text-xs mb-1">🔍 Auditable</p>
-<p class="text-slate-500 text-[11px]">See collection vs parent-bucket vs noise per tag.</p></div>
+<p class="text-slate-500 text-[11px]">Detailed tag classification table included.</p></div>
 </div></div>
+
 <div id="loading" class="hidden bg-white rounded-2xl border border-slate-200 shadow-sm p-8 text-center min-h-[450px] flex flex-col items-center justify-center">
 <div class="relative w-20 h-20 mb-6"><div class="absolute inset-0 border-4 border-blue-200 rounded-full"></div>
 <div class="absolute inset-0 border-4 border-blue-600 rounded-full border-t-transparent animate-spin"></div></div>
 <h3 id="load-title" class="text-lg font-bold">Analyzing...</h3>
-<p id="load-desc" class="text-sm text-slate-500 mb-4">Processing CSV and detecting collections...</p>
+<p id="load-desc" class="text-sm text-slate-500 mb-4">Processing CSV and detecting collections & vendor...</p>
 <div class="w-full max-w-sm bg-slate-50 rounded-xl p-4 text-left text-xs space-y-2 border">
-<div id="s1" class="flex items-center space-x-2 text-slate-400"><span class="w-4 h-4 rounded-full border border-slate-300 flex items-center justify-center text-[10px]">1</span><span>Extracting tags & filtering noise...</span></div>
+<div id="s1" class="flex items-center space-x-2 text-slate-400"><span class="w-4 h-4 rounded-full border border-slate-300 flex items-center justify-center text-[10px]">1</span><span>Extracting tags & detecting brand name...</span></div>
 <div id="s2" class="flex items-center space-x-2 text-slate-400"><span class="w-4 h-4 rounded-full border border-slate-300 flex items-center justify-center text-[10px]">2</span><span>AI classifying + specificity ranking...</span></div>
 <div id="s3" class="flex items-center space-x-2 text-slate-400"><span class="w-4 h-4 rounded-full border border-slate-300 flex items-center justify-center text-[10px]">3</span><span>Generating PDF report...</span></div>
 </div></div>
+
 <div id="results" class="hidden space-y-6">
 <div class="bg-gradient-to-r from-blue-600 to-indigo-700 rounded-2xl p-6 text-white shadow-lg flex flex-col sm:flex-row items-center justify-between gap-4">
 <div><span class="px-2.5 py-0.5 rounded-full bg-white/20 text-[10px] font-bold uppercase">Report Ready</span>
@@ -1980,12 +1921,14 @@ def get_html():
 <p id="res-subtitle" class="text-blue-100 text-xs mt-0.5"></p></div>
 <div class="flex space-x-3"><a id="dl-link" href="#" class="inline-flex items-center space-x-2 bg-white text-blue-700 px-5 py-3 rounded-xl font-bold text-sm"><i data-lucide="download" class="w-4 h-4"></i><span>Download PDF</span></a>
 <button onclick="delJob()" class="p-3 bg-white/10 hover:bg-white/20 rounded-xl"><i data-lucide="trash-2" class="w-4 h-4"></i></button></div></div>
+
 <div class="grid grid-cols-2 sm:grid-cols-5 gap-3">
 <div class="bg-white p-3 rounded-xl border"><p class="text-slate-400 text-[10px] font-semibold uppercase">Active + Published</p><p id="st-p" class="text-xl font-extrabold mt-1">0</p><p class="text-[10px] text-slate-400">Total products</p></div>
 <div class="bg-white p-3 rounded-xl border"><p class="text-slate-400 text-[10px] font-semibold uppercase">With Stock</p><p id="st-s" class="text-xl font-extrabold text-blue-600 mt-1">0</p><p class="text-[10px] text-slate-400">Positive inventory</p></div>
 <div class="bg-white p-3 rounded-xl border"><p class="text-slate-400 text-[10px] font-semibold uppercase">Out of Stock</p><p id="st-oos" class="text-xl font-extrabold text-rose-600 mt-1">0</p><p class="text-[10px] text-slate-400">Zero inventory</p></div>
 <div class="bg-white p-3 rounded-xl border"><p class="text-slate-400 text-[10px] font-semibold uppercase">Available Units</p><p id="st-u" class="text-xl font-extrabold mt-1">0</p><p class="text-[10px] text-slate-400">All locations</p></div>
 <div class="bg-white p-3 rounded-xl border"><p class="text-slate-400 text-[10px] font-semibold uppercase">Inventory Value</p><p id="st-v" class="text-lg font-extrabold text-emerald-600 mt-1">0</p><p class="text-[10px] text-slate-400">At retail price</p></div></div>
+
 <div id="ai-stats" class="hidden bg-white rounded-xl border p-4">
 <h4 class="font-bold text-sm mb-2 flex items-center space-x-2"><i data-lucide="cpu" class="w-4 h-4 text-blue-600"></i><span>AI Processing Details</span></h4>
 <div class="grid grid-cols-4 gap-3 text-center text-xs">
@@ -1994,6 +1937,7 @@ def get_html():
 <div class="p-2 bg-purple-50 rounded-lg"><p class="font-bold text-purple-700 text-lg" id="ai-calls">0</p><p class="text-slate-500">AI API Calls</p></div>
 <div class="p-2 bg-emerald-50 rounded-lg"><p class="font-bold text-emerald-700 text-lg" id="ai-tokens">0</p><p class="text-slate-500">Tokens Used</p></div>
 </div></div>
+
 <div class="bg-white rounded-2xl border overflow-hidden">
 <div class="p-4 bg-slate-50 border-b flex items-center justify-between"><h4 class="font-bold text-sm flex items-center space-x-2"><i data-lucide="layers" class="w-4 h-4 text-blue-600"></i><span>Collections</span></h4>
 <span id="st-c" class="text-xs bg-slate-200 px-2.5 py-0.5 rounded-full font-semibold">0</span></div>
@@ -2001,16 +1945,20 @@ def get_html():
 <thead><tr class="bg-slate-100/70 text-[11px] font-bold text-slate-600 uppercase sticky top-0">
 <th class="py-2.5 px-4">Collection</th><th class="py-2.5 px-3 text-center">Products</th><th class="py-2.5 px-3 text-right">Units</th><th class="py-2.5 px-4 text-right">Retail Value</th></tr></thead>
 <tbody id="col-tbody" class="divide-y divide-slate-100 text-xs"></tbody></table></div></div>
+
 <div id="tag-debug-wrap" class="hidden bg-white rounded-2xl border overflow-hidden">
 <div class="p-4 bg-slate-50 border-b"><h4 class="font-bold text-sm flex items-center space-x-2"><i data-lucide="search-check" class="w-4 h-4 text-blue-600"></i><span>Tag Classification Audit</span></h4>
-<p class="text-[11px] text-slate-500 mt-0.5">COLLECTION = named line • PARENT = category bucket (only used if no named line) • NOISE = ignored</p></div>
+<p class="text-[11px] text-slate-500 mt-0.5">COLLECTION = named line • PARENT = category bucket • NOISE = ignored</p></div>
 <div class="overflow-x-auto max-h-[320px]"><table class="w-full text-left border-collapse text-xs">
 <thead><tr class="bg-slate-100/70 text-[11px] font-bold text-slate-600 uppercase sticky top-0">
 <th class="py-2 px-3">Tag</th><th class="py-2 px-3">Verdict</th><th class="py-2 px-3">Mapped Collection</th><th class="py-2 px-3 text-right">Products</th></tr></thead>
 <tbody id="tag-debug-tbody" class="divide-y divide-slate-100"></tbody></table></div></div>
+
 </div>
 </main>
-<footer class="bg-white border-t py-4 text-center text-xs text-slate-400">Shopify Inventory Pro v4.2 — Specificity-Aware AI Collection Detection</footer>
+
+<footer class="bg-white border-t py-4 text-center text-xs text-slate-400">Shopify Inventory Pro v4.6 — Specificity-Aware AI Collection Detection</footer>
+
 <script>
 lucide.createIcons();let selFile=null,jobId=null;
 const dz=document.getElementById('dropzone');
@@ -2018,6 +1966,9 @@ const dz=document.getElementById('dropzone');
 ['dragenter','dragover'].forEach(e=>dz.addEventListener(e,()=>dz.classList.add('dropzone-active'),false));
 ['dragleave','drop'].forEach(e=>dz.addEventListener(e,()=>dz.classList.remove('dropzone-active'),false));
 dz.addEventListener('drop',e=>handleFile(e.dataTransfer.files),false);
+
+function esc(s){const d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML}
+
 function handleFile(files){if(!files||!files.length)return;const f=files[0];
 if(!f.name.toLowerCase().endsWith('.csv')){alert('Select .csv file');return}
 selFile=f;document.getElementById('file-name').textContent=f.name;
@@ -2026,12 +1977,14 @@ document.getElementById('upload-prompt').classList.add('hidden');
 document.getElementById('file-info').classList.remove('hidden');
 const b=document.getElementById('generate-btn');b.disabled=false;
 b.className="w-full py-3 rounded-xl font-semibold text-sm text-white bg-blue-600 hover:bg-blue-700 cursor-pointer flex items-center justify-center space-x-2";lucide.createIcons()}
+
 function clearFile(e){e.stopPropagation();selFile=null;
 document.getElementById('csv-file-input').value='';
 document.getElementById('upload-prompt').classList.remove('hidden');
 document.getElementById('file-info').classList.add('hidden');
 const b=document.getElementById('generate-btn');b.disabled=true;
 b.className="w-full py-3 rounded-xl font-semibold text-sm text-white bg-slate-300 cursor-not-allowed flex items-center justify-center space-x-2"}
+
 function setStep(id,s){const el=document.getElementById(id);if(!el)return;
 if(s==='active'){el.className="flex items-center space-x-2 text-blue-600 font-semibold";
 el.querySelector('span').className="w-4 h-4 rounded-full bg-blue-600 text-white flex items-center justify-center text-[10px]"}
@@ -2039,11 +1992,13 @@ else if(s==='done'){el.className="flex items-center space-x-2 text-emerald-600 f
 el.querySelector('span').className="w-4 h-4 rounded-full bg-emerald-600 text-white flex items-center justify-center text-[10px]"}
 else{el.className="flex items-center space-x-2 text-slate-400";
 el.querySelector('span').className="w-4 h-4 rounded-full border border-slate-300 flex items-center justify-center text-[10px]"}}
+
 async function startGen(){if(!selFile)return;
 document.getElementById('welcome').classList.add('hidden');
 document.getElementById('results').classList.add('hidden');
 document.getElementById('loading').classList.remove('hidden');
 setStep('s1','active');setStep('s2','pending');setStep('s3','pending');
+
 const fd=new FormData();fd.append('csv_file',selFile);
 const m=document.querySelector('input[name="mode"]:checked').value;
 fd.append('use_ai',m==='ai'?'true':'false');
@@ -2052,11 +2007,13 @@ const ig=document.getElementById('ignore-tags').value.trim();if(ig)fd.append('ig
 const ak=document.getElementById('api-key').value.trim();if(ak)fd.append('api_key',ak);
 const ab=document.getElementById('api-base').value.trim();if(ab)fd.append('api_base_url',ab);
 const am=document.getElementById('api-model').value.trim();if(am)fd.append('api_model',am);
+
 try{const r=await fetch('/api/generate',{method:'POST',body:fd});
 const d=await r.json();if(!r.ok)throw new Error(d.detail||'Failed');
 jobId=d.job_id;renderResults(d);refreshStats()}
 catch(e){alert('Error: '+e.message);document.getElementById('loading').classList.add('hidden');
 document.getElementById('welcome').classList.remove('hidden')}}
+
 function renderResults(d){document.getElementById('loading').classList.add('hidden');
 document.getElementById('results').classList.remove('hidden');
 document.getElementById('res-title').textContent=(d.brand||'Store')+' Inventory Report';
@@ -2071,15 +2028,18 @@ document.getElementById('res-subtitle').textContent=
   (d.active_published!=null?d.active_published:d.total_products)+' active+published · '+
   d.products_with_stock+' with stock · '+(d.products_out_of_stock!=null?d.products_out_of_stock:0)+' out of stock · '+
   d.collections.length+' collections';
+
 if(d.ai_stats){document.getElementById('ai-stats').classList.remove('hidden');
 document.getElementById('ai-cached').textContent=d.ai_stats.cache_hits;
 document.getElementById('ai-missed').textContent=d.ai_stats.cache_misses;
 document.getElementById('ai-calls').textContent=d.ai_stats.ai_calls;
 document.getElementById('ai-tokens').textContent=d.ai_stats.ai_tokens.toLocaleString()}
+
 const tb=document.getElementById('col-tbody');tb.innerHTML='';
 d.collections.forEach((c,i)=>{const tr=document.createElement('tr');tr.className=i%2===0?'bg-white':'bg-slate-50/60';
-tr.innerHTML='<td class="py-2.5 px-4 font-bold text-slate-800">'+c.name+'</td><td class="py-2.5 px-3 text-center">'+c.products_count+'</td><td class="py-2.5 px-3 text-right font-mono">'+c.units.toLocaleString()+'</td><td class="py-2.5 px-4 text-right font-bold font-mono">'+c.formatted_value+'</td>';
+tr.innerHTML='<td class="py-2.5 px-4 font-bold text-slate-800">'+esc(c.name)+'</td><td class="py-2.5 px-3 text-center">'+c.products_count+'</td><td class="py-2.5 px-3 text-right font-mono">'+c.units.toLocaleString()+'</td><td class="py-2.5 px-4 text-right font-bold font-mono">'+c.formatted_value+'</td>';
 tb.appendChild(tr)});
+
 if(d.tag_classification_sample&&d.tag_classification_sample.length){document.getElementById('tag-debug-wrap').classList.remove('hidden');
 const tb2=document.getElementById('tag-debug-tbody');tb2.innerHTML='';
 d.tag_classification_sample.forEach(t=>{const tr=document.createElement('tr');
@@ -2087,21 +2047,26 @@ let badge;
 if(t.category==='collection') badge='<span class="px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 text-[10px] font-bold">COLLECTION</span>';
 else if(t.category==='parent_bucket') badge='<span class="px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 text-[10px] font-bold">PARENT</span>';
 else badge='<span class="px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 text-[10px] font-bold">NOISE</span>';
-tr.innerHTML='<td class="py-1.5 px-3">'+t.tag+'</td><td class="py-1.5 px-3">'+badge+'</td><td class="py-1.5 px-3">'+(t.mapped_to||'—')+'</td><td class="py-1.5 px-3 text-right font-mono">'+t.frequency+'</td>';
+tr.innerHTML='<td class="py-1.5 px-3">'+esc(t.tag)+'</td><td class="py-1.5 px-3">'+badge+'</td><td class="py-1.5 px-3">'+esc(t.mapped_to||'—')+'</td><td class="py-1.5 px-3 text-right font-mono">'+t.frequency+'</td>';
 tb2.appendChild(tr)})}
+
 lucide.createIcons()}
+
 async function refreshStats(){try{const r=await fetch('/api/storage-stats');const s=await r.json();
 document.getElementById('cache-status').textContent='Cache: '+s.cache_files+' tags ('+s.cache_size_kb+' KB) • '+s.temp_jobs_count+' jobs'}catch(e){}}
-async function cleanServer(){if(!confirm('Delete all temp report files? (This does not touch the collection-learning cache.)'))return;
+
+async function cleanServer(){if(!confirm('Delete all temp report files?'))return;
 try{await fetch('/api/cleanup?force_all=true',{method:'POST'});refreshStats()}catch(e){}}
-async function resetLearning(){if(!confirm('This clears all cached collection-name decisions for every brand. The next report for each brand will re-run AI classification. Continue?'))return;
+
+async function resetLearning(){if(!confirm('Clear all cached collection classifications for every brand?'))return;
 try{await fetch('/api/cleanup?force_all=true&clear_classification_cache=true',{method:'POST'});refreshStats();alert('Collection learning cache cleared.')}catch(e){}}
+
 async function delJob(){if(!jobId||!confirm('Delete report?'))return;
 try{await fetch('/api/jobs/'+jobId,{method:'DELETE'});
 document.getElementById('results').classList.add('hidden');
 document.getElementById('welcome').classList.remove('hidden');refreshStats()}catch(e){}}
-refreshStats();</script></body></html>"""
 
+refreshStats();</script></body></html>"""
 
 @app.post("/api/generate")
 async def generate_inventory_report(
@@ -2127,8 +2092,10 @@ async def generate_inventory_report(
 
         products, auto_brand, inv_stats = load_products(csv_path, brand)
         use_brand = brand or auto_brand
+
         if inv_stats.get('active_published', 0) == 0:
             raise HTTPException(400, "No active & published products found.")
+
         if not products:
             raise HTTPException(
                 400,
@@ -2149,9 +2116,9 @@ async def generate_inventory_report(
         detect_time = time.time() - t0
 
         build_pdf(products, collection_map, use_brand, pdf_path, inventory_stats=inv_stats)
+
         collections_data = aggregate_by_collection(products, collection_map)
 
-        # products = unique Handles with units > 0 (positive inventory only)
         tp_stock = inv_stats['products_with_stock']
         tp_all = inv_stats['active_published']
         tp_oos = inv_stats['out_of_stock']
@@ -2160,7 +2127,7 @@ async def generate_inventory_report(
 
         cs = [{
             "name": n,
-            "products_count": len(d['products']),  # unique handles with stock
+            "products_count": len(d['products']),
             "stock_count": len(d['products']),
             "stock_out_count": 0,
             "units": d['total_units'],
@@ -2180,13 +2147,12 @@ async def generate_inventory_report(
             "status": "success",
             "job_id": job_id,
             "brand": use_brand,
-            # KPI strip (matches reference report)
-            "active_published": tp_all,             # Total products
-            "total_products": tp_all,               # alias for UI
-            "products_with_stock": tp_stock,        # Positive inventory
-            "products_out_of_stock": tp_oos,        # Zero inventory
-            "total_units": tu,                      # Available units (all locations)
-            "total_value": tv,                      # Inventory value at retail
+            "active_published": tp_all,
+            "total_products": tp_all,
+            "products_with_stock": tp_stock,
+            "products_out_of_stock": tp_oos,
+            "total_units": tu,
+            "total_value": tv,
             "formatted_value": fmt_pkr(tv),
             "collections": cs,
             "ai_stats": {**ai_stats, "detect_time_sec": round(detect_time, 3)},
@@ -2200,12 +2166,12 @@ async def generate_inventory_report(
                 "collection_tables": "Positive inventory only (units > 0)",
             },
         })
+
     except Exception as e:
         shutil.rmtree(job_dir, ignore_errors=True)
         if isinstance(e, HTTPException):
             raise e
         raise HTTPException(500, str(e))
-
 
 @app.get("/api/download/{job_id}")
 async def download_report(job_id: str):
@@ -2219,7 +2185,6 @@ async def download_report(job_id: str):
         media_type="application/pdf",
     )
 
-
 @app.delete("/api/jobs/{job_id}")
 async def delete_job_endpoint(job_id: str):
     job = JOBS.pop(job_id, None)
@@ -2232,11 +2197,9 @@ async def delete_job_endpoint(job_id: str):
         return {"status": "deleted"}
     return JSONResponse(status_code=404, content={"detail": "Not found"})
 
-
 @app.get("/api/storage-stats")
 async def storage_stats():
     return get_server_storage_stats()
-
 
 @app.post("/api/cleanup")
 async def force_cleanup(
@@ -2266,18 +2229,12 @@ async def force_cleanup(
     cleanup_old_jobs()
     return {"status": "success", "message": "Expired jobs cleaned."}
 
-
 if __name__ == "__main__":
-    # On EC2 (or any remote host) this needs to bind 0.0.0.0 to be reachable
-    # at all — 127.0.0.1 only accepts connections from the same machine.
-    # Locally on Windows/macOS 127.0.0.1 is usually what you want, so both
-    # are configurable via env vars rather than hardcoded either way.
     host = os.environ.get("SHOPIFY_REPORT_HOST", "0.0.0.0")
     port = int(os.environ.get("SHOPIFY_REPORT_PORT", "8000"))
-
     print("=" * 60)
-    print("  🚀 Shopify Inventory Report Pro v4.3.1")
-    print("     Handle math • codename collections (Mini26/MiniV2) • low unmapped")
+    print("  🚀 Shopify Inventory Report Pro v4.6")
+    print("     Handle math • AI collections • Nureh Alignment • Entity Safe")
     print("=" * 60)
     print(f"  🧠 Cache: {CACHE_DIR}")
     print(f"  🌐 http://{host}:{port}")
